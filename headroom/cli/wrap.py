@@ -39,6 +39,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
 from headroom._subprocess import pid_alive, proc_identity, run
 
@@ -61,6 +66,7 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
 from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
@@ -578,6 +584,22 @@ def _check_proxy(port: int) -> bool:
         return False
 
 
+def _foreign_listener(port: int) -> bool:
+    """True when something accepts TCP on ``port`` but is not a Headroom proxy.
+
+    ``_check_proxy`` is a bare TCP connect, so any service squatting the port
+    (observed: a caveman gateway on 8787) satisfies it. Only a ``/health``
+    payload that ``_is_headroom_health`` recognizes proves Headroom identity —
+    generic JSON such as ``{"status": "ok"}`` does not. A listener without it
+    must never be reused, restarted, or trusted as a live wrapped session.
+    """
+    if not _check_proxy(port):
+        return False
+    if _is_headroom_health(_query_proxy_health(port)):
+        return False
+    return _query_proxy_config(port) is None
+
+
 def _port_bind_error(port: int) -> OSError | None:
     """Return the bind error for a local proxy port, or None when it is usable."""
     try:
@@ -1044,6 +1066,64 @@ _code_memory_option = click.option(
     help=(
         "Code-memory MCP to register: 'serena' (default) or 'none'. "
         "Also set by HEADROOM_CODE_MEMORY. Replaces --serena/--no-serena."
+    ),
+)
+
+
+# --- Code-memory MCP scope (Claude Code only) --------------------------------
+# Where the code-memory MCP entry is written. Claude Code is the only agent we
+# wrap that has scopes: 'project' keeps the entry in ``projects[<cwd>]`` of
+# ~/.claude.json, 'user' puts it in the machine-wide map. Project is the default
+# because a code-memory server that fails to start at user scope degrades every
+# Claude Code session on the machine, including projects Headroom never touched
+# (#2787). Flows through an env var for the same reason as _code_memory_option.
+_CODE_MEMORY_SCOPE_ENV = "HEADROOM_CODE_MEMORY_SCOPE"
+_CODE_MEMORY_SCOPE_PROJECT = "project"
+_CODE_MEMORY_SCOPE_USER = "user"
+_VALID_CODE_MEMORY_SCOPES = {_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER}
+
+
+def _resolve_code_memory_scope() -> str:
+    """Resolve the requested code-memory scope ('project' by default)."""
+    env = os.environ.get(_CODE_MEMORY_SCOPE_ENV, "").strip().lower()
+    if env:
+        if env not in _VALID_CODE_MEMORY_SCOPES:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_SCOPE_ENV} must be one of: "
+                f"{', '.join(sorted(_VALID_CODE_MEMORY_SCOPES))}"
+            )
+        return env
+    return _CODE_MEMORY_SCOPE_PROJECT
+
+
+def _claude_code_memory_scope() -> str:
+    """Translate the requested scope into Claude Code's own scope name."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    if _resolve_code_memory_scope() == _CODE_MEMORY_SCOPE_USER:
+        return SCOPE_USER
+    return SCOPE_LOCAL
+
+
+def _code_memory_scope_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: mirror ``--code-memory-scope`` into the env var the
+    resolver reads, so no subcommand signature changes."""
+    if value:
+        os.environ[_CODE_MEMORY_SCOPE_ENV] = value
+    return value
+
+
+_code_memory_scope_option = click.option(
+    "--code-memory-scope",
+    type=click.Choice([_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_scope_flag_callback,
+    help=(
+        "Where to register the code-memory MCP: 'project' (default, this "
+        "directory only) or 'user' (every Claude Code session on the machine). "
+        "Also set by HEADROOM_CODE_MEMORY_SCOPE."
     ),
 )
 
@@ -1632,7 +1712,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         # is a live session (never cleared); only a port that fails the whole
         # retry window is dead. One probe here — no correlated double check.
         if _wrap_proxy_alive(port):
-            return None
+            if not _foreign_listener(port):
+                return None
+            if not _wrap_marker_is_stale(marker):
+                # The port answers but not as Headroom, yet the wrapper that
+                # wrote the marker is still alive — leave its claim alone.
+                return None
+            # A foreign service took the dead proxy's port: TCP-alive
+            # is a false liveness signal, and the writer PID is gone. Treat
+            # the marker as dead and restore below.
     elif not _wrap_marker_is_stale(marker):
         # No recorded port → fall back to PID-based staleness.
         return None
@@ -1670,14 +1758,40 @@ def _selfheal_dead_wrap_base_url() -> None:
     """
     try:
         settings_path = Path.cwd() / ".claude" / "settings.local.json"
+        marker_before = _read_wrap_marker(settings_path)
         for key in (
             _claude_wrap_base_url_env_key(),
             _claude_wrap_base_url_env_key(foundry_mode=True),
             _claude_wrap_base_url_env_key(vertex_mode=True),
         ):
             _check_and_clear_dead_wrap_marker(settings_path, key=key)
+        # The prior value a clear restores may itself be None, so detect the
+        # clear by the marker changing rather than by the return value.
+        if marker_before is not None and _read_wrap_marker(settings_path) != marker_before:
+            _warn_live_proxy_after_selfheal(marker_before)
     except Exception:  # noqa: BLE001 - hook must never break session startup
         pass
+
+
+def _warn_live_proxy_after_selfheal(dead_marker: dict[str, Any] | None) -> None:
+    """After clearing a dead wrap route, point at a live proxy if one exists.
+
+    Deliberately warn-only: repointing settings at another session's proxy
+    would silently adopt a proxy this project never chose (different backend,
+    mode, or owner). The message names the exact command instead.
+    """
+    from headroom.cli.port_discovery import find_live_proxy_elsewhere
+
+    dead_port = dead_marker.get("port") if isinstance(dead_marker, dict) else None
+    requested = dead_port if isinstance(dead_port, int) else 8787
+    live = find_live_proxy_elsewhere(requested)
+    if live is None:
+        return
+    click.echo(
+        f"headroom: a Headroom proxy is running on port {live}; route this project "
+        f"through it with: headroom wrap claude --port {live}",
+        err=True,
+    )
 
 
 def _wrap_selfheal_hook_command() -> str:
@@ -1699,36 +1813,34 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     with a SessionStart hook that runs the hidden ``wrap selfheal`` command.
     SessionStart ONLY (never PreToolUse): the self-heal must not run per Bash
     call mid-session, where a transient probe blip could clear a live session.
-    Idempotent — an existing entry carrying the marker is not duplicated.
+    Idempotent — an existing entry carrying the marker is not duplicated; if its
+    command drifted (hand edit, moved headroom binary) it is rewritten in place.
     """
     payload = _read_settings_for_write(settings_path)
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
     entries = (
         list(hooks.get("SessionStart") or []) if isinstance(hooks.get("SessionStart"), list) else []
     )
-    already = any(
-        isinstance(entry, dict)
-        and isinstance(entry.get("hooks"), list)
-        and any(
-            isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
-            for item in entry["hooks"]
-        )
+    command = _wrap_selfheal_hook_command()
+    marked = [
+        item
         for entry in entries
-    )
-    if already:
-        return
-    entries.append(
-        {
-            "matcher": "startup|resume",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": _wrap_selfheal_hook_command(),
-                    "timeout": 10,
-                }
-            ],
-        }
-    )
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+        for item in entry["hooks"]
+        if isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
+    ]
+    if marked:
+        if all(item.get("command") == command for item in marked):
+            return
+        for item in marked:
+            item["command"] = command
+    else:
+        entries.append(
+            {
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": command, "timeout": 10}],
+            }
+        )
     hooks["SessionStart"] = entries
     payload["hooks"] = hooks
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2406,6 +2518,8 @@ def _setup_serena_mcp(
     from headroom.mcp_registry.base import RegisterStatus
     from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
+    ownership_key = getattr(registrar, "ownership_key", lambda name: name)("serena")
+
     if not registrar.detect():
         if verbose:
             click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
@@ -2423,7 +2537,9 @@ def _setup_serena_mcp(
     owned_drift = (
         result.status == RegisterStatus.MISMATCH
         and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+        and headroom_installed_matching(
+            registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+        )
     )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
@@ -2436,8 +2552,15 @@ def _setup_serena_mcp(
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
 
+    # Retire the machine-wide entry once the project-scoped one is in place.
+    # Must run before record_install below: the ledger still holds the
+    # fingerprint of the entry that was installed globally, which is how we
+    # recognise it as ours.
+    if result.ok:
+        _retire_user_scope_serena(registrar)
+
     if result.status == RegisterStatus.REGISTERED:
-        record_install(registrar.name, spec)
+        record_install(registrar.name, spec, ownership_key=ownership_key)
 
     line = format_result(
         registrar.name,
@@ -2455,6 +2578,11 @@ def _setup_serena_mcp(
     )
     if line is not None:
         click.echo(line)
+
+    # Say where it landed, so the scope is discoverable without reading docs.
+    # Only on an actual write (or in verbose): re-wraps should stay quiet.
+    if result.status == RegisterStatus.REGISTERED or verbose:
+        _echo_serena_scope_note(registrar)
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
@@ -2481,9 +2609,89 @@ def _setup_serena_mcp(
     _index_serena_project(verbose=verbose)
 
 
+def _echo_serena_scope_note(registrar: Any) -> None:
+    """Tell the user which sessions the Serena entry will load in."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    scope = getattr(registrar, "scope", None)
+    if scope == SCOPE_LOCAL:
+        click.echo(
+            "    scoped to this project — pass --code-memory-scope user to register it "
+            "for every Claude Code session"
+        )
+    elif scope == SCOPE_USER:
+        click.echo(
+            "    registered for every Claude Code session on this machine "
+            "(--code-memory-scope user)"
+        )
+
+
+def _retire_user_scope_serena(registrar: Any) -> None:
+    """Remove a machine-wide Serena entry left by a pre-#2787 wrap.
+
+    Headroom used to register Serena at Claude Code's user scope, where a
+    Serena that fails to start breaks *every* Claude Code session on the
+    machine — including projects that were never wrapped (#2783). Now that the
+    entry is written per project, the global one is redundant, so an upgrading
+    user gets it cleaned up on their next wrap instead of carrying the blast
+    radius forever.
+
+    Only entries the ledger proves Headroom installed are removed; a Serena the
+    user registered globally themselves is left exactly where it is. No-ops for
+    registrars without scopes (Codex, Grok, OpenCode) and when the user asked
+    for user scope explicitly.
+    """
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    if getattr(registrar, "scope", None) != SCOPE_LOCAL:
+        return
+    try:
+        global_entry = registrar.get_server("serena", scope=SCOPE_USER)
+    except TypeError:  # registrar predates scoped reads
+        return
+    if not headroom_installed_matching(registrar.name, global_entry):
+        return
+    if registrar.unregister_server("serena", scope=SCOPE_USER):
+        # Clear the legacy ledger record along with the config entry it
+        # authorized — otherwise its fingerprint outlives the migration and
+        # can later be mistaken for proof that Headroom owns a same-named
+        # entry the user installs globally themselves.
+        clear_install(registrar.name, "serena")
+        click.echo(
+            "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
+            "(it now loads only in this project)"
+        )
+
+
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    # Claude can own one Serena entry per project plus a legacy user entry.
+    # Examine each relevant scope independently: an unscoped delete would
+    # remove entries whose scope-specific ledger record did not authorize it.
+    if hasattr(registrar, "ownership_key"):
+        from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+        found_owned = False
+        for scope in (SCOPE_LOCAL, SCOPE_USER):
+            current = registrar.get_server("serena", scope=scope)
+            ownership_key = registrar.ownership_key("serena", scope=scope)
+            if current is None:
+                # Nothing left to protect — an ownership record must not
+                # outlive the entry it authorized.
+                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                continue
+            if not headroom_installed_matching(
+                registrar.name, current, ownership_key=ownership_key
+            ):
+                continue
+            found_owned = True
+            if not registrar.unregister_server("serena", scope=scope):
+                return "failed"
+            clear_install(registrar.name, "serena", ownership_key=ownership_key)
+        return "removed" if found_owned else "not_headroom_owned"
 
     current = registrar.get_server("serena")
     if not headroom_installed_matching(registrar.name, current):
@@ -2542,10 +2750,21 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
     """Remove the tokensave MCP entry only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
-    current = registrar.get_server("tokensave")
+    # Headroom only ever installed tokensave machine-wide: it was retired before
+    # #2787 introduced project scope, so its ledger key is the pre-scope (user
+    # scope) one. Pin the ownership check and the delete to that scope — an
+    # unscoped delete now also takes the project entry, which no ledger record
+    # authorizes, and an unscoped read lets a project entry shadow ours.
+    at_user_scope: dict[str, Any] = {}
+    if hasattr(registrar, "ownership_key"):  # Claude; the others have no scopes
+        from headroom.mcp_registry.claude import SCOPE_USER
+
+        at_user_scope = {"scope": SCOPE_USER}
+
+    current = registrar.get_server("tokensave", **at_user_scope)
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
-    if registrar.unregister_server("tokensave"):
+    if registrar.unregister_server("tokensave", **at_user_scope):
         clear_install(registrar.name, "tokensave")
         return "removed"
     return "failed"
@@ -2636,10 +2855,9 @@ _CODEX_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
 
 def _codex_home_dir() -> Path:
     """Return Codex's config directory, respecting ``CODEX_HOME`` when set."""
-    codex_home = os.environ.get("CODEX_HOME")
-    if codex_home:
-        return Path(codex_home).expanduser()
-    return Path.home() / ".codex"
+    from headroom.install.paths import codex_home_dir
+
+    return codex_home_dir()
 
 
 def _codex_profile_from_args(codex_args: tuple[str, ...]) -> str | None:
@@ -2695,6 +2913,13 @@ def _codex_dotted_key(*parts: str) -> str:
     return ".".join(
         part if _CODEX_BARE_KEY_RE.fullmatch(part) else json.dumps(part) for part in parts
     )
+
+
+_CODEX_EMBEDDED_MODE_NOTE = (
+    "Note: session-scoped routing runs Codex without its shared background server "
+    "(embedded mode). To keep the shared server, route through Codex config instead: "
+    "run `headroom init codex` (or `headroom init -g codex`) once, then start `codex` directly."
+)
 
 
 def _codex_session_launch_settings(
@@ -2756,6 +2981,11 @@ def _codex_session_launch_settings(
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
+    # Routing is passed as ``--config`` so it stays scoped to this process, and
+    # Codex runs any session with command-line overrides in embedded mode,
+    # without its shared background server (#3888). Say so up front, and point
+    # at the persistent alternative that leaves the shared server in play.
+    display.append(_CODEX_EMBEDDED_MODE_NOTE)
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 
@@ -2844,16 +3074,23 @@ def _strip_codex_headroom_blocks(
         content,
     )
 
-    # Strip any orphaned `[model_providers.headroom]` table with the fields we
-    # write.  We only remove it if the table is recognisably ours (base_url
-    # mentions localhost and a Headroom proxy port).  This protects users who
-    # happen to have a differently configured `headroom` provider.
-    orphan_headroom_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
-        r"(?=^\[|\Z)"
-    )
-    content = orphan_headroom_table.sub("", content)
+    # Remove an orphaned local-proxy provider structurally. Text-level table
+    # matching cannot safely distinguish comments, multiline strings, and
+    # arrays of tables from a provider's body.
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        pass
+    else:
+        providers = document.get("model_providers")
+        if isinstance(providers, MutableMapping):
+            provider = providers.get("headroom")
+            base_url = provider.get("base_url") if isinstance(provider, Mapping) else None
+            if isinstance(base_url, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+/v1", base_url):
+                del providers["headroom"]
+                content = tomlkit.dumps(document)
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -2867,17 +3104,51 @@ _REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
 
 
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
-    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap."""
-    if "[model_providers.headroom]" not in content:
+    """Remove a legacy Headroom provider table without touching other TOML.
+
+    ``tomlkit`` identifies tables structurally, preserving comments, string
+    values, and arrays of tables that text-level table-boundary matching can
+    mistake for provider content. The injector owns this provider name, so an
+    existing table is replaced by the current Headroom configuration.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
         return content
 
-    import re  # local import to match surrounding helper convention
+    providers = document.get("model_providers")
+    if not isinstance(providers, MutableMapping):
+        return content
+    provider = providers.get("headroom")
+    if not isinstance(provider, Mapping):
+        return content
+    del providers["headroom"]
+    return str(tomlkit.dumps(document))
 
-    provider_table = re.compile(
-        r"(?ms)^[ \t]*\[model_providers\.headroom\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
-    )
-    content = provider_table.sub("", content)
-    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+def _strip_existing_codex_memory_mcp_table(content: str) -> str:
+    """Remove an unmarked memory MCP table without text-level TOML parsing.
+
+    TOMLKit resolves quoted keys and finds table boundaries structurally, so
+    comments, multiline strings, and arrays of tables remain untouched.
+    Invalid source TOML is deliberately left unchanged; the caller validates
+    its complete generated candidate before it can overwrite the file.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        return content
+
+    mcp_servers = document.get("mcp_servers")
+    if not isinstance(mcp_servers, MutableMapping) or "headroom_memory" not in mcp_servers:
+        return content
+
+    del mcp_servers["headroom_memory"]
+    return str(tomlkit.dumps(document))
 
 
 def _redirect_existing_top_level_keys(content: str, port: int) -> str:
@@ -2979,6 +3250,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
 # Canonical casing for the proxy's per-project savings header (matched
 # case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
 _PROJECT_HEADER_NAME = "X-Headroom-Project"
+_PROJECT_CWD_HEADER_NAME = "X-Headroom-Cwd"
 
 
 def _project_name_from_cwd() -> str | None:
@@ -2994,29 +3266,52 @@ def _project_name_from_cwd() -> str | None:
     return urllib.parse.quote(name, safe="-_.() ")
 
 
+def _project_cwd_from_cwd() -> str | None:
+    """Return the canonical launch directory for X-Headroom-Cwd.
+
+    The full path is the collision-resistant project identity used by memory
+    and CCR routing. Percent-encoding keeps the value valid in an HTTP header;
+    the resolver decodes it before normalising and hashing the path.
+    """
+    cwd = str(Path.cwd().resolve()).strip()
+    if not cwd:
+        return None
+    return urllib.parse.quote(cwd, safe="/:._-~()")
+
+
 def _apply_project_header_env(env: dict[str, str]) -> None:
-    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+    """Inject project label and routing identity into custom headers.
 
     Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
     ``Name: value`` lines and attaches them to every API request; the
-    Headroom proxy uses the X-Headroom-Project header for per-project
-    savings attribution.  An existing user-supplied x-headroom-project
-    header (any casing) always wins — we never duplicate or overwrite it,
-    and any other user headers are preserved by appending.
+    Headroom proxy uses X-Headroom-Project for per-project savings
+    attribution and X-Headroom-Cwd for collision-resistant memory/CCR
+    routing. Existing user-supplied headers (any casing) always win — we
+    never duplicate or overwrite them, and all other user headers are
+    preserved by appending.
     """
     project = _project_name_from_cwd()
     if not project:
         return
-    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    cwd = _project_cwd_from_cwd()
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    existing_names: set[str] = set()
     if existing:
         for line in existing.splitlines():
             name = line.split(":", 1)[0].strip()
-            if name.lower() == _PROJECT_HEADER_NAME.lower():
-                return  # user override wins
-        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
-    else:
-        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+            existing_names.add(name.lower())
+
+    generated: list[str] = []
+    if _PROJECT_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_HEADER_NAME}: {project}")
+    if cwd and _PROJECT_CWD_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_CWD_HEADER_NAME}: {cwd}")
+    if not generated:
+        return
+
+    env["ANTHROPIC_CUSTOM_HEADERS"] = (
+        "\n".join([existing, *generated]) if existing else "\n".join(generated)
+    )
 
 
 # Codex's own built-in providers plus Headroom's injected one — never treated
@@ -3147,6 +3442,9 @@ def _inject_codex_provider_config(port: int) -> str | None:
     """
     config_file, backup_file = _codex_config_paths()
     config_dir = config_file.parent
+    # Never repoint an existing headroom provider to another port silently: a
+    # different live proxy (or a persistent install) may own the old route.
+    warn_codex_provider_port_change(config_file, port)
 
     # Detect an existing custom OpenAI-compatible provider BEFORE building the
     # injected block below, so it can be preserved as the upstream the proxy
@@ -3272,6 +3570,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
                 f"\n{provider_section}"
             )
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         if custom_upstream_base_url:
@@ -3499,10 +3799,21 @@ def _inject_memory_mcp_config(user_id: str) -> None:
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
                 content = content[:start].rstrip("\n") + mcp_section + content[end:].lstrip("\n")
             else:
+                # No marker yet. A `[mcp_servers.headroom_memory]` table can
+                # still exist unmarked — e.g. a user copied the snippet from
+                # this module's docstring by hand, or the table survived
+                # from before markers guarded this injection. Strip it first
+                # so we don't end up with two `[mcp_servers.headroom_memory]`
+                # tables, which is invalid TOML and silently breaks Codex's
+                # MCP config parsing (last-table-wins or hard failure
+                # depending on the TOML parser).
+                content = _strip_existing_codex_memory_mcp_table(content)
                 content = content.rstrip() + "\n" + mcp_section
         else:
             content = mcp_section
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
@@ -3542,6 +3853,18 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
 def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
     return _copilot_resolve_provider_type(backend, provider_type)
+
+
+def _is_headroom_health(payload: dict[str, Any] | None) -> bool:
+    """True when a /health payload identifies a Headroom proxy.
+
+    The Python proxy reports ``service: "headroom-proxy"`` plus a ``config``
+    block; the Rust proxy reports only ``{"ok": true, "service": "headroom-proxy"}``.
+    Any other JSON (a generic ``{"status": "ok"}``) is a foreign service.
+    """
+    if payload is None:
+        return False
+    return payload.get("service") == "headroom-proxy" or _proxy_health_config(payload) is not None
 
 
 def _query_proxy_config(port: int) -> dict[str, Any] | None:
@@ -3689,9 +4012,16 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
-    running_release = _normalize_release_version(running_version)
     # -dev is a display marker for source builds; compare the base release so a
-    # dev CLI still restarts a stale proxy on a real version difference.
+    # dev CLI still restarts a stale proxy on a real version difference. The
+    # suffix must be stripped from the running version too: with it intact,
+    # "0.34.0-dev" fails the release regex, normalizes to None, and the check
+    # below silently never fires for source-built proxies. The scheme is always
+    # "<base>-dev" (get_version in headroom/_version.py); any future "-rcN" or
+    # "-dev.N" style would need stripping here as well.
+    running_release = _normalize_release_version(
+        running_version.removesuffix("-dev") if running_version is not None else None
+    )
     current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None
@@ -4279,6 +4609,19 @@ def _ensure_proxy_unlocked(
                 "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
+        if (
+            not isolated_copilot_subscription_proxy
+            and manifest is not None
+            and helpers._foreign_listener(port)
+        ):
+            # The manifest's port is held by a non-Headroom service; recovery
+            # can never rebind it. Skip the respawn/wait entirely and start a
+            # fresh proxy on another port.
+            click.echo(
+                f"  Persistent deployment '{manifest.profile}' port {port} is held by a "
+                "non-Headroom service; starting a fresh proxy on another port."
+            )
+            manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
             from headroom.install.health import probe_ready
 
@@ -4405,31 +4748,47 @@ def _ensure_proxy_unlocked(
                                 f"Persistent deployment '{manifest.profile}' on port {port} "
                                 "could not be restarted with requested features."
                             )
-                elif helpers._check_proxy(port):
+                elif helpers._check_proxy(port) and not helpers._foreign_listener(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
                     )
+                # A foreign (non-Headroom) listener squatting the manifest's
+                # port is treated like a stale deployment: fall through and
+                # start a fresh proxy on another port.
             if not persistent_routing_mismatch:
                 click.echo(
                     f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
                     "is stale; starting a fresh proxy instead."
                 )
 
-        if (
+        proxy_listener = (
             not isolated_copilot_subscription_proxy
             and not persistent_routing_mismatch
             and helpers._check_proxy(port)
+        )
+        health_payload = helpers._query_proxy_health(port) if proxy_listener else None
+        running_config = helpers._proxy_health_config(health_payload)
+        if proxy_listener and running_config is None:
+            running_config = helpers._query_proxy_config(port)
+        if (
+            proxy_listener
+            and running_config is None
+            and not helpers._is_headroom_health(health_payload)
         ):
+            # TCP accepted, but /health did not identify a Headroom proxy — a
+            # foreign service is squatting the port. Fall through to the port
+            # search below instead of reusing (or "version-restarting") it.
+            click.echo(
+                f"  Port {port} is in use by a non-Headroom service; selecting another port..."
+            )
+            proxy_listener = False
+        if proxy_listener:
             # Proxy is running — check if it has the features we need
             needs_restart = False
             # Set False when the running proxy must not serve this session at
             # all (routing-level mismatch with live clients attached): fall
             # through to a fresh start on a different port.
             reuse_running = True
-            health_payload = helpers._query_proxy_health(port)
-            running_config = helpers._proxy_health_config(health_payload)
-            if running_config is None:
-                running_config = helpers._query_proxy_config(port)
             routing_mismatches = (
                 None
                 if running_config is None
@@ -4936,6 +5295,10 @@ def _launch_tool(
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            env_vars_display = [
+                line.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                for line in env_vars_display
+            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
@@ -5266,19 +5629,15 @@ def wrap_selfheal(marker: str | None) -> None:
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
-    "--port",
-    default=8787,
-    type=click.IntRange(1, 65535),
-    help="Proxy port (default: 8787)",
-)
+# no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
+@proxy_port_option("--port")
 @click.option(
     "--no-mcp",
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
 @_code_memory_option
+@_code_memory_scope_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
@@ -5378,6 +5737,7 @@ def claude(
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --code-memory none # No code-memory MCP
+        headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
@@ -5519,10 +5879,15 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
+        # Registered per project by default so a Serena that cannot start takes
+        # down this project's sessions only, never every Claude Code session on
+        # the machine (#2787). --code-memory-scope user restores the old
+        # machine-wide registration. The Headroom MCP registrar above keeps user
+        # scope: it is our own server and every wrap exercises it.
         from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
-            ClaudeRegistrar(),
+            ClaudeRegistrar(scope=_claude_code_memory_scope()),
             serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
@@ -5620,7 +5985,10 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            # The URL above is built from actual_port; stamping the requested
+            # port here made the marker/owner claim point at the wrong port
+            # whenever _ensure_proxy fell back to another one.
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -5849,9 +6217,7 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
     "--backend",
@@ -6189,7 +6555,7 @@ def copilot(
 
 
 @wrap.command("vscode")
-@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@proxy_port_option()
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
     "--settings-file",
@@ -6272,7 +6638,7 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
 
 
 @wrap.command("vscode-claude")
-@click.option("--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port")
+@proxy_port_option()
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
     "--settings-file",
@@ -6594,9 +6960,7 @@ def _run_codex_wrap(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option(
     "--no-mcp",
     is_flag=True,
@@ -6706,9 +7070,7 @@ def codex(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6788,9 +7150,7 @@ def aider(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6859,9 +7219,7 @@ def vibe(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6953,9 +7311,7 @@ def kimi(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
 @click.option(
@@ -7084,9 +7440,7 @@ def grok(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to .cursor/rules/)"
@@ -7143,9 +7497,7 @@ def cursor(
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7213,9 +7565,7 @@ def grok_build(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7278,9 +7628,7 @@ def cline(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7344,9 +7692,7 @@ def zcode(
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -7444,8 +7790,8 @@ def continue_dev(
     is_flag=True,
     help="Install by copying plugin path instead of using --link",
 )
-@click.option(
-    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+@proxy_port_option(
+    "--proxy-port", help_text="Headroom proxy port (default: $HEADROOM_PORT, else 8787)"
 )
 @click.option("--startup-timeout-ms", default=20000, type=int, help="Proxy startup timeout")
 @click.option(
@@ -7686,9 +8032,7 @@ def openclaw(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.option(
@@ -8220,9 +8564,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -8494,13 +8836,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             is_flag=True,
             help="Enable code graph indexing via codebase-memory-mcp (optional)",
         ),
-        click.option(
-            "--port",
-            "-p",
-            default=8787,
-            type=click.IntRange(1, 65535),
-            help="Proxy port (default: 8787)",
-        ),
+        proxy_port_option(),
         _retired_context_tool_option,
     ):
         command = decorator(command)

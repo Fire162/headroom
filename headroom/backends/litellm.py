@@ -997,9 +997,18 @@ class LiteLLMBackend(Backend):
                     for tr in tool_result_blocks:
                         tr_content = tr.get("content", "")
                         if isinstance(tr_content, list):
-                            tr_content = "\n".join(
-                                b.get("text", "") for b in tr_content if b.get("type") == "text"
-                            )
+                            # A tool_result content list is usually
+                            # ``{"type":"text",...}`` blocks, but a client may put
+                            # a bare string in the list. ``b.get`` on a str raised
+                            # AttributeError and 500'd the whole request; accept
+                            # bare strings and skip non-text/other blocks.
+                            text_pieces: list[str] = []
+                            for b in tr_content:
+                                if isinstance(b, str):
+                                    text_pieces.append(b)
+                                elif isinstance(b, dict) and b.get("type") == "text":
+                                    text_pieces.append(b.get("text", ""))
+                            tr_content = "\n".join(text_pieces)
                         tool_msg: dict[str, Any] = {
                             "role": "tool",
                             "tool_call_id": tr["tool_use_id"],
@@ -1970,6 +1979,15 @@ class LiteLLMBackend(Backend):
 
             async for chunk in response:
                 chunk_dict = chunk.model_dump(exclude_none=True, exclude_unset=True)
+                # Report the model the client requested, not the LiteLLM-mapped
+                # provider slug (e.g. "openrouter/qwen3",
+                # "bedrock/us.anthropic.claude-..."). send_openai_message already
+                # rewrites the model to original_model on the non-streaming path;
+                # without this the streaming and non-streaming responses disagree
+                # and OpenAI clients that key cost/telemetry on the model field
+                # see an unrecognized name for every streamed request.
+                if "model" in chunk_dict:
+                    chunk_dict["model"] = original_model
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
             yield "data: [DONE]\n\n"

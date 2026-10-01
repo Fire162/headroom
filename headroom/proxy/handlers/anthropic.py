@@ -365,7 +365,9 @@ class AnthropicHandlerMixin:
         (``headroom/memory/storage_router.py``) so CCR and memory always
         agree on which project a request belongs to. Tier order matches:
         ``x-headroom-project-id`` → ``x-headroom-cwd`` → CLI override →
-        ``cwd:`` line in the system prompt.
+        ``cwd:`` line in the system prompt. ``x-headroom-project`` is only a
+        human-readable savings label and is intentionally not an identity
+        signal.
 
         Returns:
             ``(workspace_key, workspace_label)``. If no signal yields a
@@ -1212,6 +1214,7 @@ class AnthropicHandlerMixin:
             # point on, `headers` is the upstream-bound copy.
             from headroom.proxy.helpers import (
                 _strip_internal_headers,
+                apply_keep_last_turns,
                 log_outbound_headers,
                 merge_extra_headers,
             )
@@ -1299,7 +1302,8 @@ class AnthropicHandlerMixin:
                 # Per-project memory routing (GH #462). Build the context
                 # once here so save / search / inject all resolve against
                 # the same workspace. Tier order: explicit project-id /
-                # cwd headers → CLI override → system prompt env block.
+                # cwd / project headers → CLI override → system prompt env
+                # block.
                 from headroom.memory.storage_router import (
                     RequestContext as _MemRequestContext,
                 )
@@ -1507,6 +1511,25 @@ class AnthropicHandlerMixin:
                     logger.debug(f"[{request_id}] pre_compress hook error: {e}")
             else:
                 _hook_ctx = None
+
+            # x-headroom-keep-last-turns: N — trim history before optimization.
+            # Consumed here (after bypass check, after _strip_internal_headers)
+            # so it never leaks upstream.  Fail-open: any malformed value is
+            # silently ignored and the full message list is used instead.
+            _klt_raw = request.headers.get("x-headroom-keep-last-turns", "").strip()
+            if _klt_raw and not _bypass:
+                try:
+                    _klt = int(_klt_raw)
+                    messages, _klt_dropped = apply_keep_last_turns(messages, _klt)
+                    if _klt_dropped:
+                        logger.info(
+                            "[%s] keep-last-turns=%d: dropped %d leading messages",
+                            request_id,
+                            _klt,
+                            _klt_dropped,
+                        )
+                except ValueError:
+                    pass  # malformed value — never break the request
 
             # Apply optimization
             transforms_applied = []
@@ -2594,8 +2617,8 @@ class AnthropicHandlerMixin:
                     elif self.ccr_context_tracker and not ccr_workspace_key:
                         logger.info(
                             f"[{request_id}] CCR: workspace unresolved; skipping "
-                            "track_compression (fail-closed — no x-headroom-cwd / "
-                            "x-headroom-project-id header and no cwd: in system prompt)"
+                            "track_compression (fail-closed — no workspace header "
+                            "and no cwd: in system prompt)"
                         )
 
             # CCR Proactive Expansion: Check if current query needs expanded context.
@@ -2605,19 +2628,11 @@ class AnthropicHandlerMixin:
                 and self.config.ccr_proactive_expansion
                 and ccr_workspace_key
             ):
-                # Extract user query from messages
-                user_query = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            user_query = content
-                        elif isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    user_query = block.get("text", "")
-                                    break
-                        break
+                # Relevance query for this turn. Same helper the compression
+                # pipeline scores with, so both read the query the same way;
+                # `latest_user_turn_only` keeps the previous behaviour of not
+                # reaching back past the newest user turn.
+                user_query = extract_user_query(messages, latest_user_turn_only=True)
 
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(
@@ -2797,6 +2812,7 @@ class AnthropicHandlerMixin:
                     existing_tools=tools,
                     memory_tools_to_inject=memory_tool_defs,
                     inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    client_declared_tools=bool(_original_tools),
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
@@ -3247,7 +3263,27 @@ class AnthropicHandlerMixin:
             # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
             # tools array, and repairing before it validated against a stale view).
             # Nothing past this point mutates `body["tools"]` on the outbound path.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+            from headroom.proxy.helpers import (
+                strip_unsupported_tool_search_blocks,
+                strip_unsupported_tool_search_references,
+            )
+
+            # The tools array is repaired first: it shrinks what a history
+            # tool_reference can resolve against, so the block repair below has to
+            # validate against the final view (same reason as the ORDERING note).
+            _ts_tools, _ts_refs_dropped = strip_unsupported_tool_search_references(
+                body.get("tools")
+            )
+            if _ts_refs_dropped:
+                body["tools"] = tools = _ts_tools
+                body_mutation_tracker.mark_mutated("tool_search_reference_repair")
+                transforms_applied.append(f"router:tool_search_ref_repair:{_ts_refs_dropped}refs")
+                logger.info(
+                    "[%s] Tool search: dropped %d unresolvable tool_reference "
+                    "entr(y/ies) naming a typed search tool",
+                    request_id,
+                    _ts_refs_dropped,
+                )
 
             _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
                 body.get("messages"), body.get("tools")
@@ -4372,6 +4408,11 @@ class AnthropicHandlerMixin:
                                         f"CCR: Got response status={cont_response.status_code}, "
                                         f"content-encoding={cont_response.headers.get('content-encoding')}"
                                     )
+                                    if not 200 <= cont_response.status_code < 300:
+                                        raise RuntimeError(
+                                            "CCR continuation returned non-success status "
+                                            f"{cont_response.status_code}"
+                                        )
                                     result: dict[str, Any] = cont_response.json()
                                     logger.info("CCR: Parsed JSON successfully")
                                     return result
@@ -4395,52 +4436,83 @@ class AnthropicHandlerMixin:
                                     api_call_fn,
                                     provider="anthropic",
                                 )
-                                final_resp_json = preserve_opaque_response_fields(
-                                    resp_json, final_resp_json
-                                )
-                                # Update response content with final response
-                                resp_json = final_resp_json
-                                # Remove encoding headers since content is now uncompressed JSON
-                                ccr_response_headers = {
-                                    k: v
-                                    for k, v in response.headers.items()
-                                    if k.lower() not in ("content-encoding", "content-length")
-                                }
-                                try:
-                                    ccr_content = json.dumps(final_resp_json).encode()
-                                except (TypeError, ValueError) as json_err:
-                                    logger.warning(
-                                        f"[{request_id}] CCR: JSON serialization failed: {json_err}"
+                                if final_resp_json is resp_json:
+                                    # The handler intentionally returns the same
+                                    # object for both a failed continuation and
+                                    # an intentional mixed-tool skip. Identity is
+                                    # still the right signal for whether to
+                                    # re-serialize, but not for the diagnostic
+                                    # message; classify the residual tools first.
+                                    from headroom.ccr.response_handler import (
+                                        RESIDUAL_CCR_ERROR,
+                                        RESIDUAL_CCR_SKIPPED_MIXED,
                                     )
-                                    ccr_content = json.dumps(resp_json).encode()
-                                response = httpx.Response(
-                                    status_code=200,
-                                    content=ccr_content,
-                                    headers=ccr_response_headers,
-                                )
-                                # Only claim success when no headroom_retrieve remains.
-                                # On an intentional mixed-tool skip (#839) the response
-                                # still carries headroom_retrieve for the client to
-                                # resolve — logging "handled successfully" there is
-                                # misleading. Classify via the shared, provider-generic
-                                # residual-CCR signal.
-                                from headroom.ccr.response_handler import (
-                                    RESIDUAL_CCR_SKIPPED_MIXED,
-                                )
 
-                                residual_status = self.ccr_response_handler.residual_ccr_status(
-                                    final_resp_json, "anthropic"
-                                )
-                                if residual_status == RESIDUAL_CCR_SKIPPED_MIXED:
-                                    logger.info(
-                                        f"[{request_id}] CCR: Skipped retrieval — "
-                                        "headroom_retrieve returned alongside a client "
-                                        "tool for the client to resolve"
+                                    residual_status = self.ccr_response_handler.residual_ccr_status(
+                                        final_resp_json, "anthropic"
                                     )
+                                    if residual_status == RESIDUAL_CCR_SKIPPED_MIXED:
+                                        logger.info(
+                                            f"[{request_id}] CCR: Skipped retrieval — "
+                                            "headroom_retrieve returned alongside a client "
+                                            "tool for the client to resolve"
+                                        )
+                                    elif residual_status == RESIDUAL_CCR_ERROR:
+                                        logger.info(
+                                            f"[{request_id}] CCR: Continuation failed; "
+                                            "forwarding the original upstream response"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[{request_id}] CCR: Retrieval handled successfully"
+                                        )
                                 else:
-                                    logger.info(
-                                        f"[{request_id}] CCR: Retrieval handled successfully"
+                                    final_resp_json = preserve_opaque_response_fields(
+                                        resp_json, final_resp_json
                                     )
+                                    # Update response content with final response
+                                    resp_json = final_resp_json
+                                    # Remove encoding headers since content is now uncompressed JSON
+                                    ccr_response_headers = {
+                                        k: v
+                                        for k, v in response.headers.items()
+                                        if k.lower() not in ("content-encoding", "content-length")
+                                    }
+                                    try:
+                                        ccr_content = json.dumps(final_resp_json).encode()
+                                    except (TypeError, ValueError) as json_err:
+                                        logger.warning(
+                                            f"[{request_id}] CCR: JSON serialization failed: {json_err}"
+                                        )
+                                        ccr_content = json.dumps(resp_json).encode()
+                                    response = httpx.Response(
+                                        status_code=200,
+                                        content=ccr_content,
+                                        headers=ccr_response_headers,
+                                    )
+                                    # Only claim success when no headroom_retrieve remains.
+                                    # On an intentional mixed-tool skip (#839) the response
+                                    # still carries headroom_retrieve for the client to
+                                    # resolve — logging "handled successfully" there is
+                                    # misleading. Classify via the shared, provider-generic
+                                    # residual-CCR signal.
+                                    from headroom.ccr.response_handler import (
+                                        RESIDUAL_CCR_SKIPPED_MIXED,
+                                    )
+
+                                    residual_status = self.ccr_response_handler.residual_ccr_status(
+                                        final_resp_json, "anthropic"
+                                    )
+                                    if residual_status == RESIDUAL_CCR_SKIPPED_MIXED:
+                                        logger.info(
+                                            f"[{request_id}] CCR: Skipped retrieval — "
+                                            "headroom_retrieve returned alongside a client "
+                                            "tool for the client to resolve"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[{request_id}] CCR: Retrieval handled successfully"
+                                        )
                             except Exception as e:
                                 import traceback
 
