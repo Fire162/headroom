@@ -17,7 +17,7 @@ from typing import Any
 from ...managed_block import block_pattern, sanitize_block_text
 
 # Marker delimiters for Headroom-managed sections (matches learn/writer.py).
-# Same outermost-pair pattern and same content sanitising: memory content is
+# Same block pattern and same content sanitising: memory content is
 # extracted from conversations, so it is as attacker-influenced as tool output.
 MARKER_START = "<!-- headroom:memory:start -->"
 MARKER_END = "<!-- headroom:memory:end -->"

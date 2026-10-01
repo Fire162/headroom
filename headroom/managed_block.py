@@ -18,11 +18,12 @@ file while the model still reads it.
 visible by design: a reviewer diffing the file sees that something tried to
 open a comment.
 
-:func:`block_pattern` matches from the first start marker to the **last** end
-marker. A well-formed file has one of each, so this is the same match as
-before; a file poisoned by an earlier version (a nested end marker followed by
-injected text) is re-absorbed whole and comes out well-formed on the next
-write.
+:func:`block_pattern` matches from a start marker to the **nearest** end
+marker. Because written content can no longer contain our end marker, that is
+the whole block, and the match never runs past it into hand-written text that
+happens to quote the marker later in the file. A file an earlier version
+already split keeps its escaped tail outside the block: the tail no longer
+grows, but it has to be removed by hand.
 """
 
 from __future__ import annotations
@@ -36,8 +37,8 @@ def sanitize_block_text(text: str) -> str:
 
 
 def block_pattern(start: str, end: str) -> re.Pattern[str]:
-    """Pattern for the managed block: first *start* marker to the **last** *end*."""
-    return re.compile(re.escape(start) + r".*" + re.escape(end), re.DOTALL)
+    """Pattern for the managed block: *start* marker to the nearest *end* marker."""
+    return re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
 
 
 __all__ = ["block_pattern", "sanitize_block_text"]

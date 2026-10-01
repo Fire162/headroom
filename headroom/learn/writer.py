@@ -22,8 +22,7 @@ from .models import (
     RecommendationTarget,
 )
 
-# Marker delimiters for Headroom-managed sections. The pattern spans from the
-# first start marker to the LAST end marker, and everything written between
+# Marker delimiters for Headroom-managed sections. Everything written between
 # them goes through sanitize_block_text() first, so transcript-derived content
 # cannot close the block early (see headroom.managed_block).
 _MARKER_START = "<!-- headroom:learn:start -->"

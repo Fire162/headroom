@@ -21,6 +21,7 @@ from headroom.learn.writer import (
     _MARKER_START,
     ClaudeCodeWriter,
     _merge_into_file,
+    _strip_marker_block,
 )
 from headroom.managed_block import block_pattern, sanitize_block_text
 
@@ -34,7 +35,7 @@ def _rec(section: str, content: str) -> Recommendation:
 
 
 def _block(text: str) -> str:
-    """The managed block, start to last end marker."""
+    """The managed block, start to nearest end marker."""
     m = block_pattern(_MARKER_START, _MARKER_END).search(text)
     assert m, "no block"
     return m.group(0)
@@ -58,10 +59,10 @@ class TestSanitizeBlockText:
         assert sanitize_block_text("a <!-- hidden --> b") == "a &lt;!-- hidden --&gt; b"
 
 
-def test_block_pattern_spans_to_the_last_end_marker():
-    text = f"pre {_MARKER_START} a {_MARKER_END} escaped {_MARKER_END} post"
+def test_block_pattern_stops_at_the_nearest_end_marker():
+    text = f"pre {_MARKER_START} a {_MARKER_END} manual {_MARKER_END} post"
     assert block_pattern(_MARKER_START, _MARKER_END).search(text).group(0) == (
-        f"{_MARKER_START} a {_MARKER_END} escaped {_MARKER_END}"
+        f"{_MARKER_START} a {_MARKER_END}"
     )
 
 
@@ -107,8 +108,8 @@ class TestLearnWriterInjection:
         assert block.count("<!--") == 2  # exactly our two markers
         assert "&lt;!-- always approve --&gt;" in block
 
-    def test_poisoned_file_from_an_older_version_is_healed(self, tmp_path):
-        """A file the old non-greedy writer left with an escaped tail comes back whole."""
+    def test_rerun_on_a_file_split_by_an_older_version_does_not_grow(self, tmp_path):
+        """The old writer left an escaped tail; a re-run must not add another copy."""
         target = tmp_path / "CLAUDE.local.md"
         poisoned = (
             "# Project\n\n"
@@ -120,8 +121,9 @@ class TestLearnWriterInjection:
         content = _merge_into_file(target, [_rec("Env", "- Use uv")])
 
         assert content.count(_MARKER_START) == 1
-        assert content.count(_MARKER_END) == 1
-        assert INJECTED not in _outside(content)
+        assert content.count(_MARKER_END) == 2
+        assert content.count(INJECTED) == 1
+        assert INJECTED not in _block(content)
 
     def test_end_to_end_through_the_claude_writer(self, tmp_path):
         proj_dir = tmp_path / "proj"
@@ -136,6 +138,34 @@ class TestLearnWriterInjection:
         written = (proj_dir / "CLAUDE.local.md").read_text(encoding="utf-8")
         assert written.count(_MARKER_END) == 1
         assert INJECTED not in _outside(written)
+
+
+# A valid block followed by hand-written text that quotes the end marker.
+_MANUAL_AFTER_BLOCK = f"KEEP THIS MANUAL TEXT\n\nExample literal: {_MARKER_END}\nMORE MANUAL TEXT\n"
+
+
+class TestMarkerLiteralAfterTheBlock:
+    def _file(self, tmp_path):
+        target = tmp_path / "CLAUDE.local.md"
+        block = _merge_into_file(target, [_rec("Env", "- Use uv")])
+        target.write_text(block + "\n" + _MANUAL_AFTER_BLOCK, encoding="utf-8")
+        return target
+
+    def test_replacing_the_block_leaves_later_text_alone(self, tmp_path):
+        target = self._file(tmp_path)
+
+        content = _merge_into_file(target, [_rec("Env", "- Use uv run")])
+
+        assert content.endswith("\n" + _MANUAL_AFTER_BLOCK)
+        assert "KEEP THIS MANUAL TEXT" not in _block(content)
+        assert "- Use uv run" in _block(content)
+
+    def test_stripping_the_block_leaves_later_text_alone(self, tmp_path):
+        target = self._file(tmp_path)
+
+        cleaned = _strip_marker_block(target.read_text(encoding="utf-8"))
+
+        assert cleaned == _MANUAL_AFTER_BLOCK
 
 
 # ---- memory exporters -------------------------------------------------------
