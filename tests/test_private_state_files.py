@@ -236,7 +236,7 @@ class TestMemoryStoresArePrivate:
         assert _mode(base.with_suffix(".hnsw")) == 0o600
         assert _mode(base.with_suffix(".meta")) == 0o600
         # A re-save over a file left wide by an older version narrows it.
-        os.chmod(base.with_suffix(".hnsw"), 0o644)
+        os.chmod(base.with_suffix(".hnsw"), 0o640)
         index.save_index(base)
         assert _mode(base.with_suffix(".hnsw")) == 0o600
 
