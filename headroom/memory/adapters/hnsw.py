@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ...fileperms import open_owner_only
+from ...fileperms import ensure_private_file, open_owner_only
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -813,8 +813,11 @@ class HNSWVectorIndex:
         path = Path(path)
 
         with self._lock:
-            # Save HNSW index
+            # Save HNSW index. hnswlib opens the path itself and would create
+            # it at the umask, so make it a private regular file first (refusing
+            # a symlink); its truncating write keeps the 0600 mode.
             hnsw_path = path.with_suffix(".hnsw")
+            ensure_private_file(hnsw_path, what="HNSW index")
             self._index.save_index(str(hnsw_path))
 
             # Save metadata, mappings, and embeddings

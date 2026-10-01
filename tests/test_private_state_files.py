@@ -207,7 +207,8 @@ class TestMemoryStoresArePrivate:
             pytest.skip(f"sqlite-vec unavailable here: {exc}")
         assert _mode(p) == 0o600
 
-    def test_hnsw_metadata_dump(self, tmp_path):
+    @staticmethod
+    def _hnsw_index():
         # Never ``importorskip("hnswlib")`` here: on runners without AVX the
         # native import dies with SIGILL and takes the whole pytest shard with
         # it. The adapter's probe runs the import in a subprocess.
@@ -226,9 +227,28 @@ class TestMemoryStoresArePrivate:
         index = HNSWVectorIndex(dimension=4, max_elements=16)
         mem = Memory(content="secret fact", user_id="alice", embedding=np.ones(4, dtype=np.float32))
         asyncio.run(index.index(mem))
+        return index
+
+    def test_hnsw_index_and_metadata_files(self, tmp_path):
+        index = self._hnsw_index()
         base = tmp_path / "idx"
         index.save_index(base)
+        assert _mode(base.with_suffix(".hnsw")) == 0o600
         assert _mode(base.with_suffix(".meta")) == 0o600
+        # A re-save over a file left wide by an older version narrows it.
+        os.chmod(base.with_suffix(".hnsw"), 0o644)
+        index.save_index(base)
+        assert _mode(base.with_suffix(".hnsw")) == 0o600
+
+    def test_hnsw_index_refuses_planted_symlink(self, tmp_path):
+        index = self._hnsw_index()
+        target = tmp_path / "elsewhere.bin"
+        target.write_bytes(b"untouched")
+        base = tmp_path / "idx"
+        base.with_suffix(".hnsw").symlink_to(target)
+        with pytest.raises(PermissionError):
+            index.save_index(base)
+        assert target.read_bytes() == b"untouched"
 
 
 def test_native_memory_dir_is_0700(tmp_path):
