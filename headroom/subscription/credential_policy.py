@@ -23,8 +23,11 @@ from typing import Any
 from headroom.proxy.loopback_guard import is_loopback_host
 
 # Any of these means the request crossed another hop (a gateway or reverse
-# proxy on the same host), so the loopback peer is not the end caller.
-_FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip")
+# proxy on the same host), so the loopback peer is not the end caller. The
+# whole ``X-Forwarded-*`` family counts (``-For``, ``-Proto``, ``-Host``, and
+# any added later), so a gateway that sends only one of them still fails closed.
+_FORWARDING_HEADERS = frozenset({"forwarded", "x-real-ip"})
+_FORWARDING_HEADER_PREFIX = "x-forwarded-"
 
 
 def is_local_operator_connection(conn: Any) -> bool:
@@ -40,10 +43,11 @@ def is_local_operator_connection(conn: Any) -> bool:
         return False
     headers = getattr(conn, "headers", None)
     if headers is not None:
-        for name in _FORWARDING_HEADERS:
-            try:
-                if headers.get(name):
+        try:
+            for name in headers.keys():
+                name = name.lower()
+                if name in _FORWARDING_HEADERS or name.startswith(_FORWARDING_HEADER_PREFIX):
                     return False
-            except Exception:
-                return False
+        except Exception:
+            return False
     return True

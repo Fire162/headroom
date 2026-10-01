@@ -15,13 +15,14 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from starlette.datastructures import Headers
 
 from headroom.subscription import codex_rate_limits
 from headroom.subscription.credential_policy import is_local_operator_connection
 from headroom.subscription.tracker import SubscriptionTracker
 
 
-def _conn(host: str | None, headers: dict[str, str] | None = None) -> SimpleNamespace:
+def _conn(host: str | None, headers: dict[str, str] | Headers | None = None) -> SimpleNamespace:
     client = SimpleNamespace(host=host) if host is not None else None
     return SimpleNamespace(client=client, headers=headers or {})
 
@@ -45,8 +46,23 @@ def test_direct_loopback_caller_is_the_local_operator(host: str) -> None:
         _conn("127.0.0.1", {"x-forwarded-for": "203.0.113.9"}),
         _conn("127.0.0.1", {"forwarded": "for=203.0.113.9"}),
         _conn("127.0.0.1", {"x-real-ip": "203.0.113.9"}),
+        _conn("127.0.0.1", {"x-forwarded-proto": "https"}),
+        _conn("127.0.0.1", {"x-forwarded-host": "public.example"}),
+        _conn("127.0.0.1", {"X-Forwarded-Port": "443"}),
+        _conn("127.0.0.1", Headers({"X-Forwarded-Proto": "https"})),
     ],
-    ids=["lan", "lan2", "no-peer", "xff", "forwarded", "x-real-ip"],
+    ids=[
+        "lan",
+        "lan2",
+        "no-peer",
+        "xff",
+        "forwarded",
+        "x-real-ip",
+        "xfp-only",
+        "xfh-only",
+        "xf-port",
+        "starlette-xfp",
+    ],
 )
 def test_network_forwarded_or_unknown_callers_are_not(conn) -> None:  # noqa: ANN001
     assert is_local_operator_connection(conn) is False
