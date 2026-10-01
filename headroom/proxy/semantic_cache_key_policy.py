@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 from collections.abc import Mapping
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Per-process key for the cache partition HMAC. The semantic response cache is
 # an in-memory, per-process structure, so the partition only has to be stable
@@ -70,12 +73,26 @@ def compute_cache_partition(
     return "p_" + digest[:32]
 
 
-def compute_request_cache_partition(request: Any) -> str:
-    """Partition for a live proxy request: credentials + authenticated principal."""
+def compute_request_cache_partition(request: Any) -> str | None:
+    """Partition for a live proxy request: credentials + authenticated principal.
+
+    Returns ``None`` when an installed identity resolver raises. The caller
+    must then bypass the response cache (no lookup, no store): falling back to
+    the credential-only partition would let tenants sharing one operator key
+    read each other's cached responses.
+    """
     from headroom.proxy.identity import resolve_authenticated_principal
 
+    try:
+        principal = resolve_authenticated_principal(request)
+    except Exception:
+        logger.warning(
+            "Identity resolver failed; bypassing the response cache for this request",
+            exc_info=True,
+        )
+        return None
     headers = getattr(request, "headers", None) or {}
-    return compute_cache_partition(headers, principal=resolve_authenticated_principal(request))
+    return compute_cache_partition(headers, principal=principal)
 
 
 def strip_cache_control(obj: Any) -> Any:

@@ -46,13 +46,14 @@ def resolve_authenticated_principal(request: Any) -> str | None:
     and both return ``None`` here. Callers that must isolate data between
     principals (e.g. the response cache) combine this with the caller's own
     provider credential rather than trusting the default identity.
+
+    An exception from the installed resolver propagates: the caller cannot
+    tell "no principal" from "principal unknown", so it must decide how to
+    fail closed rather than silently share data across principals.
     """
     if _resolver is None:
         return None
-    try:
-        principal = _resolver(request, default="")
-    except Exception:
-        return None
+    principal = _resolver(request, default="")
     return principal or None
 
 

@@ -3756,10 +3756,11 @@ class OpenAIHandlerMixin:
         cache_lookup_messages = messages
         # Response-cache partition: a cached response is only ever replayed to a
         # caller presenting the same provider credentials and principal (01-F15).
-        # Snapshotted with the key fields so lookup and store agree.
+        # Snapshotted with the key fields so lookup and store agree. None means
+        # the principal could not be established: skip the cache entirely.
         cache_partition = compute_request_cache_partition(request)
         # Check cache
-        if self.cache and not stream:
+        if self.cache and not stream and cache_partition is not None:
             cached = await self.cache.get(
                 messages, model, partition=cache_partition, **cache_key_fields
             )
@@ -5636,7 +5637,12 @@ class OpenAIHandlerMixin:
                 # site, which let a response built for a stream:true request
                 # answer a later non-streaming caller (#3019). Stating the
                 # invariant keeps that from being reintroduced silently.
-                if self.cache and not stream and response.status_code == 200:
+                if (
+                    self.cache
+                    and not stream
+                    and cache_partition is not None
+                    and response.status_code == 200
+                ):
                     await self.cache.set(
                         cache_lookup_messages,
                         model,

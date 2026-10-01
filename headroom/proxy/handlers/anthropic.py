@@ -1375,11 +1375,12 @@ class AnthropicHandlerMixin:
             cache_lookup_messages = messages
             # Response-cache partition: a cached response is only ever replayed to a
             # caller presenting the same provider credentials and principal (01-F15).
-            # Snapshotted with the key fields so lookup and store agree.
+            # Snapshotted with the key fields so lookup and store agree. None means
+            # the principal could not be established: skip the cache entirely.
             cache_partition = compute_request_cache_partition(request)
             # Check cache (non-streaming only)
             cache_hit = False
-            if self.cache and not stream:
+            if self.cache and not stream and cache_partition is not None:
                 cached = await self.cache.get(
                     messages, model, partition=cache_partition, **cache_key_fields
                 )
@@ -4774,6 +4775,7 @@ class AnthropicHandlerMixin:
                         if (
                             self.cache
                             and not stream
+                            and cache_partition is not None
                             and response.status_code == 200
                             and resp_json is not None
                         ):

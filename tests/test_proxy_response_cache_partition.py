@@ -11,6 +11,7 @@ threaded through every cache lookup and store.
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from headroom.proxy.semantic_cache import SemanticCache
 from headroom.proxy.semantic_cache_key_policy import (
     ANONYMOUS_PARTITION,
     compute_cache_partition,
+    compute_request_cache_partition,
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
@@ -243,5 +245,62 @@ def test_installed_identity_resolver_partitions_callers_on_one_operator_key() ->
             assert "answer 1" in r1.text
             assert "answer 2" in r2.text
             assert len(calls) == 2
+    finally:
+        identity.set_identity_resolver(None)
+
+
+def _failing_resolver(request, *, default):  # noqa: ANN001
+    raise RuntimeError("identity backend unavailable")
+
+
+def test_failing_identity_resolver_yields_no_partition() -> None:
+    identity.set_identity_resolver(_failing_resolver)
+    try:
+        request = SimpleNamespace(headers={"x-api-key": "shared-operator-key"})
+        assert compute_request_cache_partition(request) is None
+    finally:
+        identity.set_identity_resolver(None)
+
+
+@pytest.mark.parametrize(
+    "path,body,reply,headers",
+    [
+        (
+            "/v1/messages",
+            ANTHROPIC_BODY,
+            _anthropic_reply,
+            {"x-api-key": "shared-operator-key", "anthropic-version": "2023-06-01"},
+        ),
+        (
+            "/v1/chat/completions",
+            OPENAI_BODY,
+            _openai_reply,
+            {"authorization": "Bearer shared-operator-key"},
+        ),
+    ],
+    ids=["anthropic", "openai"],
+)
+def test_failing_identity_resolver_bypasses_the_response_cache(path, body, reply, headers) -> None:
+    # A resolver that raises must not collapse tenants on one operator key into
+    # the credential-only partition: the cache is neither read nor written.
+    identity.set_identity_resolver(_failing_resolver)
+    try:
+        with _client() as client:
+            proxy = client.app.state.proxy
+            calls: list[str] = []
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                calls.append("x")
+                return reply(f"answer {len(calls)}")
+
+            proxy._retry_request = _fake_retry
+            texts = [
+                client.post(path, headers={**headers, "x-test-user": who}, json=body).text
+                for who in ("alice", "bob", "alice")
+            ]
+            assert "answer 1" in texts[0]
+            assert "answer 1" not in texts[1] and "answer 2" in texts[1]
+            assert "answer 3" in texts[2]
+            assert len(calls) == 3
     finally:
         identity.set_identity_resolver(None)
