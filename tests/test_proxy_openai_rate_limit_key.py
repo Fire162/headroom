@@ -4,10 +4,11 @@
 showed the other side of that: a caller the proxy cannot authenticate could
 rotate the credential header to mint a fresh bucket per request. Both hold now:
 
-* an **authenticated** caller (proxy token) or a loopback / trusted-gateway
-  caller gets one bucket per provider credential — #3364's behaviour;
+* an **authenticated** caller (proxy token) or a direct loopback caller gets
+  one bucket per provider credential — #3364's behaviour;
 * an **unauthenticated remote** caller is charged per peer, whatever credential
-  header it sends.
+  header it sends — including one relayed by a trusted gateway, which is
+  charged per forwarded client address.
 """
 
 from __future__ import annotations
@@ -152,3 +153,61 @@ def test_unauthenticated_remote_callers_on_different_peers_do_not_share(monkeypa
             )
             statuses.append(client.post(path, json=body).status_code)
     assert statuses == [200, 200]
+
+
+@pytest.mark.parametrize("endpoint", [CHAT, RESPONSES], ids=["chat", "responses"])
+def test_unauthenticated_caller_behind_trusted_gateway_cannot_rotate_credentials(
+    monkeypatch, endpoint
+) -> None:
+    """A trusted gateway vouches for the client address, not for the caller."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.0.0.0/8")
+    path, body, upstream_body = endpoint
+    forwarded = {"x-forwarded-for": "203.0.113.9"}
+    with TestClient(create_app(_config()), client=("10.0.0.2", 1)) as client:
+        client.app.state.proxy._retry_request = AsyncMock(
+            side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
+        )
+        proxy, first, second = _two_requests(
+            client,
+            path,
+            body,
+            {**forwarded, "api-key": "rotated-A"},
+            {**forwarded, "api-key": "rotated-B"},
+        )
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert proxy._retry_request.await_count == 1
+
+
+def test_trusted_gateway_keys_unauthenticated_callers_by_forwarded_address(monkeypatch) -> None:
+    """Distinct forwarded clients behind one gateway keep distinct buckets."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.0.0.0/8")
+    path, body, upstream_body = CHAT
+    with TestClient(create_app(_config()), client=("10.0.0.2", 1)) as client:
+        client.app.state.proxy._retry_request = AsyncMock(
+            side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
+        )
+        statuses = [
+            client.post(path, headers={"x-forwarded-for": ip}, json=body).status_code
+            for ip in ("203.0.113.9", "198.51.100.4")
+        ]
+    assert statuses == [200, 200]
+
+
+def test_authenticated_caller_behind_trusted_gateway_gets_one_bucket_per_credential(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.0.0.0/8")
+    path, body, upstream_body = CHAT
+    headers = {"x-forwarded-for": "203.0.113.9", "x-headroom-proxy-token": TOKEN}
+    with TestClient(create_app(_config(proxy_token=TOKEN)), client=("10.0.0.2", 1)) as client:
+        client.app.state.proxy._retry_request = AsyncMock(
+            side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
+        )
+        _, first, second = _two_requests(
+            client, path, body, {**headers, "api-key": "key-A"}, {**headers, "api-key": "key-B"}
+        )
+    assert (first.status_code, second.status_code) == (200, 200)

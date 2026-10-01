@@ -21,7 +21,9 @@ The rule now:
    distinct principals behind one address (a team gateway, a NAT) do not share a
    limit — decision D2, one proxy is shared by several principals. A request is
    trusted when it presented the proxy token (the security gate records that on
-   ``request.state``), came from loopback, or came from a trusted-gateway peer.
+   ``request.state``) or came directly from loopback. A trusted-gateway peer is
+   trusted to report the caller's address, not to vouch that the caller
+   authenticated, so forwarded requests without the token are untrusted.
 3. For an **untrusted** request (no token configured and a remote caller) the
    credential is ignored: the bucket is the peer. Rotating a header cannot mint
    a new bucket for someone the proxy cannot authenticate.
@@ -89,15 +91,20 @@ def _direct_peer_is_trusted_gateway(request: Any) -> bool:
 
 
 def is_trusted_request(request: Any) -> bool:
-    """True when the caller authenticated, or reached us via loopback / a trusted gateway."""
+    """True when the caller presented the proxy token, or connected directly from loopback.
+
+    A request relayed by a trusted gateway (even one on loopback) is keyed by
+    the forwarded client address unless it presented the proxy token: the
+    gateway vouches for that address, not for the caller's credential.
+    """
     state = getattr(request, "state", None)
     if state is not None and getattr(state, PROXY_AUTHENTICATED_STATE_ATTR, False):
         return True
+    if _direct_peer_is_trusted_gateway(request):
+        return False
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None
-    if host and is_loopback_host(host):
-        return True
-    return _direct_peer_is_trusted_gateway(request)
+    return bool(host and is_loopback_host(host))
 
 
 def rate_limit_identity(request: Any, headers: Any = None) -> str:

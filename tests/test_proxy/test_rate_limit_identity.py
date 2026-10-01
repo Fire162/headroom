@@ -68,11 +68,17 @@ def test_loopback_is_trusted_without_a_token() -> None:
     )
 
 
-def test_trusted_gateway_peer_is_trusted(monkeypatch) -> None:
+def test_trusted_gateway_peer_alone_does_not_authenticate_the_caller(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.20.0.0/16")
     keyed = {"authorization": "Bearer k1"}
-    assert "|cred:" in rate_limit_identity(_request("10.20.3.4", headers=keyed))
-    assert rate_limit_identity(_request("10.21.3.4", headers=keyed)) == "peer:10.21.3.4"
+    assert rate_limit_identity(_request("10.20.3.4", headers=keyed)) == "peer:10.20.3.4"
+    assert "|cred:" in rate_limit_identity(_request("10.20.3.4", authenticated=True, headers=keyed))
+
+
+def test_loopback_gateway_does_not_authenticate_forwarded_callers(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
+    keyed = {"authorization": "Bearer k1"}
+    assert "|cred:" not in rate_limit_identity(_request("127.0.0.1", headers=keyed))
 
 
 def test_ipv6_peers_are_grouped_by_slash_64() -> None:
