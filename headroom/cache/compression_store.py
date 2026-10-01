@@ -1210,6 +1210,22 @@ def get_compression_store(
     return _compression_store
 
 
+def detach_compression_store() -> None:
+    """Drop the global compression store without clearing it.
+
+    The next :func:`get_compression_store` builds a fresh store from the
+    current settings. Unlike :func:`reset_compression_store`, the old store's
+    entries are left as they are: nothing is deleted from its backend, so a
+    SQLite file is neither written nor emptied. Used when the proxy switches to
+    stateless mode at runtime. The old backend is not closed, because code
+    that already holds the old store may still be using it.
+    """
+    global _compression_store
+
+    with _store_lock:
+        _compression_store = None
+
+
 def reset_compression_store() -> None:
     """Reset the global compression store. Mainly for testing."""
     global _compression_store

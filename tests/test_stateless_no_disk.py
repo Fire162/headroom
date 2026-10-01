@@ -149,15 +149,45 @@ def test_stateful_turn_does_write_the_ccr_store(workspace):
     assert (workspace / "ccr_store.db").exists()
 
 
-def test_stateless_reset_replaces_a_store_built_before_the_flag(workspace):
-    """A SQLite singleton created earlier in the process is dropped, not kept."""
+def _ccr_db_state(workspace: Path) -> tuple[int, dict[str, bytes]]:
+    """Row count plus the exact bytes of ccr_store.db and its WAL/SHM files."""
+    import sqlite3
+
+    db = workspace / "ccr_store.db"
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()[0]
+    finally:
+        conn.close()
+    files = {p.name: p.read_bytes() for p in sorted(workspace.glob("ccr_store.db*"))}
+    return rows, files
+
+
+def test_stateless_switch_leaves_an_existing_sqlite_store_untouched(workspace):
+    """A SQLite singleton built before the flag is swapped out, not cleared.
+
+    Entering stateless mode must not write to (or empty) a ccr_store.db that
+    already holds entries; it only stops using it.
+    """
     from headroom.proxy.server import ProxyConfig, _apply_stateless_persistence
 
     stateful = cs.get_compression_store()  # default backend: SQLite
     assert not isinstance(stateful._backend, InMemoryBackend)
+    kept = stateful.store('{"rows": [1, 2, 3]}', '{"rows": [1]}')
+    rows_before, bytes_before = _ccr_db_state(workspace)
+    assert rows_before == 1
+
     paths.set_process_stateless(True)
     _apply_stateless_persistence(ProxyConfig(stateless=True))
-    assert isinstance(cs.get_compression_store()._backend, InMemoryBackend)
+    stateless = cs.get_compression_store()
+    assert isinstance(stateless._backend, InMemoryBackend)
+    fresh = stateless.store('{"rows": [4, 5, 6]}', '{"rows": [4]}')
+    assert stateless.retrieve(fresh) is not None
+
+    rows_after, bytes_after = _ccr_db_state(workspace)
+    assert rows_after == rows_before, "stateless switch deleted persisted CCR entries"
+    assert bytes_after == bytes_before, "stateless switch wrote to ccr_store.db"
+    assert stateful.retrieve(kept) is not None
 
 
 # ---- the shared predicate ---------------------------------------------------
