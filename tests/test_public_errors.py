@@ -194,7 +194,7 @@ def test_compress_endpoint_error_body_has_no_exception_detail(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_memory_tool_result_hides_transport_text_but_keeps_validation_text(tmp_path) -> None:
+async def test_memory_tool_result_hides_transport_and_internal_text(tmp_path) -> None:
     from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
     handler = MemoryHandler(
@@ -218,11 +218,60 @@ async def test_memory_tool_result_hides_transport_text_but_keeps_validation_text
     assert SECRET not in json.dumps(transport)
     assert transport["error"] == public_errors.UPSTREAM_UNREACHABLE
 
-    backend.exc = RuntimeError("save failed")
-    validation = json.loads(
-        await handler._execute_memory_tool("memory_save", {"content": "x"}, "u1")
+    backend.exc = RuntimeError(f"save failed at {LEAKY}")
+    internal = json.loads(await handler._execute_memory_tool("memory_save", {"content": "x"}, "u1"))
+    assert internal["error"] == public_errors.INTERNAL_ERROR
+    assert LEAKY not in json.dumps(internal)
+
+
+# --- Unclassified exceptions fail closed ---------------------------------------
+
+# Exception text that names a local path, an internal host and a token.
+LEAKY = r"sqlite at C:\service\tenant-a.db via db-int.corp.example failed with sk-live-secret"
+
+UNCLASSIFIED = [
+    RuntimeError(LEAKY),
+    ValueError(LEAKY),
+    KeyError(LEAKY),
+    json.JSONDecodeError(LEAKY, "{}", 0),
+]
+
+
+@pytest.mark.parametrize("exc", UNCLASSIFIED, ids=lambda e: type(e).__name__)
+def test_client_message_hides_unclassified_exception_text(exc) -> None:
+    message = public_errors.client_message(exc, LEAKY)
+    assert message == public_errors.public_message(public_errors.INTERNAL_ERROR)
+    assert "sk-live-secret" not in message
+
+
+@pytest.mark.parametrize("exc", UNCLASSIFIED, ids=lambda e: type(e).__name__)
+def test_tool_result_error_hides_unclassified_exception_text(exc) -> None:
+    result = public_errors.tool_result_error(exc)
+    assert result["error"] == public_errors.INTERNAL_ERROR
+    assert "sk-live-secret" not in json.dumps(result)
+
+
+def test_client_message_forwards_provider_http_error_response() -> None:
+    import openai
+
+    response = httpx.Response(401, request=httpx.Request("POST", "https://api.example/v1"))
+    exc = openai.AuthenticationError("invalid x-api-key", response=response, body=None)
+    assert public_errors.client_message(exc, "invalid x-api-key") == "invalid x-api-key"
+
+
+@pytest.mark.asyncio
+async def test_litellm_backend_hides_unclassified_exception_text(monkeypatch) -> None:
+    from headroom.backends import litellm as litellm_backend
+
+    monkeypatch.setattr(litellm_backend, "acompletion", AsyncMock(side_effect=RuntimeError(LEAKY)))
+    backend = litellm_backend.LiteLLMBackend(provider="openai")
+    result = await backend.send_openai_message(
+        {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, {}
     )
-    assert validation == {"status": "error", "error": "save failed"}
+    assert "sk-live-secret" not in json.dumps(result.body)
+    assert result.body["error"]["message"] == public_errors.public_message(
+        public_errors.INTERNAL_ERROR
+    )
 
 
 # --- Tags (10-F4) -------------------------------------------------------------
@@ -236,6 +285,7 @@ def test_extract_tags_never_carries_credentials() -> None:
             "x-headroom-session-id": "s-1",
             "x-headroom-license-token": "lic",
             "x-headroom-api-key": "k",
+            "X-Headroom-Key": "hr_cloud_key",
             "authorization": "Bearer sk-live",
         }
     )

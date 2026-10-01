@@ -15,11 +15,12 @@ The rule enforced here is simple and applies to every response path:
 * **Transport-layer and internal exception text never reaches a client.** It is
   logged server-side with the request id, and the client receives one of the
   fixed codes below plus that request id so the two can be correlated.
-* **Provider API error text is not transport text.** A model provider's own
-  ``{"error": {"message": ...}}`` (authentication failed, model not found,
-  rate limited) is addressed to the caller and is forwarded unchanged by the
-  callers of this module. :func:`classify_exception` returns ``None`` for
-  those so the caller can keep the provider's message.
+* **Only a provider's own HTTP error response is forwarded.** A model
+  provider's ``{"error": {"message": ...}}`` (authentication failed, model not
+  found, rate limited) is addressed to the caller. It is recognised by
+  exception type (:func:`is_provider_response_error`), never by guessing from
+  text; every other exception (``RuntimeError``, ``ValueError``, parser,
+  database or library errors) fails closed to :data:`INTERNAL_ERROR`.
 
 The module is pure policy: no I/O, no logging, no FastAPI types. Handlers and
 backends build their wire shape (OpenAI ``{"error": {...}}`` or Anthropic
@@ -104,11 +105,9 @@ def _is_tls_failure(exc: BaseException) -> bool:
 def classify_exception(exc: BaseException) -> str | None:
     """Return the public code for a transport/runtime failure, or ``None``.
 
-    ``None`` means "this is not a transport-layer or interpreter-level failure";
-    the caller decides what to do with it. Backends use that to forward a
-    provider's own API error message; handlers with a catch-all ``except``
-    should treat ``None`` as :data:`INTERNAL_ERROR` because anything that
-    escaped the handler unclassified was never meant for a client.
+    ``None`` means "this is not a transport-layer failure". Client-facing code
+    uses :func:`classify_or_internal` so that anything unrecognised becomes
+    :data:`INTERNAL_ERROR`: it was never meant for a client.
     """
     if _is_tls_failure(exc):
         return UPSTREAM_TLS_ERROR
@@ -210,28 +209,48 @@ def anthropic_error_body(
     return body
 
 
-def client_message(exc: BaseException, fallback: str) -> str:
+def is_provider_response_error(exc: BaseException) -> bool:
+    """True when ``exc`` carries a model provider's HTTP error response.
+
+    LiteLLM's provider errors (AuthenticationError, NotFoundError,
+    RateLimitError, ...) subclass ``openai.APIStatusError``. Imported lazily:
+    neither SDK is needed to import this module.
+    """
+    try:
+        import openai
+
+        if isinstance(exc, openai.APIStatusError):
+            return True
+    except ImportError:  # pragma: no cover - openai is a proxy-extra dependency
+        pass
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.APIStatusError):
+            return True
+    except ImportError:  # pragma: no cover - optional dependency
+        pass
+    return False
+
+
+def client_message(exc: BaseException, provider_text: str) -> str:
     """The message a client may see for ``exc``.
 
-    Transport and OS failures map to the fixed vocabulary. Anything else
-    returns ``fallback`` unchanged: backends pass the provider's own error
-    text here because that text is addressed to the caller (authentication,
-    model not found, rate limited) and hiding it would only move the problem
-    to the log.
+    ``provider_text`` is returned only when ``exc`` is a provider's HTTP error
+    response (authentication, model not found, rate limited): that text is
+    addressed to the caller. Transport failures map to their fixed code and
+    anything else to :data:`INTERNAL_ERROR`; the caller logs the real text.
     """
-    code = classify_exception(exc)
-    return public_message(code) if code else fallback
+    if is_provider_response_error(exc):
+        return provider_text
+    return public_message(classify_or_internal(exc))
 
 
 def tool_result_error(exc: BaseException) -> dict[str, Any]:
     """``{"status": "error", ...}`` for a JSON tool result returned to a model.
 
-    Same split as :func:`client_message`: a storage or network failure names
-    only its code (the model cannot act on a socket path and the user should
-    not see one), while an application-level message raised on purpose by
-    the tool implementation is kept.
+    The model only ever sees a fixed code: a storage, network or internal
+    failure names no path, host or library. The caller logs the real text.
     """
-    code = classify_exception(exc)
-    if code is None:
-        return {"status": "error", "error": str(exc)}
+    code = classify_or_internal(exc)
     return {"status": "error", "error": code, "message": public_message(code)}

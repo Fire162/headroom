@@ -31,6 +31,7 @@ CREDENTIAL_NAME_COMPONENTS: frozenset[str] = frozenset(
         "credentials",
         "authorization",
         "apikey",
+        "key",  # x-headroom-key (Headroom Cloud), x-headroom-api-key
         "bearer",
         "cookie",
         "signature",
@@ -51,10 +52,7 @@ def is_credential_tag_key(key: str) -> bool:
     parts = _name_components(key)
     if parts[:2] == ["x", "headroom"]:
         parts = parts[2:]
-    if any(part in CREDENTIAL_NAME_COMPONENTS for part in parts):
-        return True
-    # ``api-key`` splits into two ordinary words; match the adjacent pair.
-    return any(a == "api" and b == "key" for a, b in zip(parts, parts[1:], strict=False))
+    return any(part in CREDENTIAL_NAME_COMPONENTS for part in parts)
 
 
 def _normalise_name(name: str) -> str:
