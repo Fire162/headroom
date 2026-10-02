@@ -365,7 +365,10 @@ class UsageReporter:
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             # Owner-only: the envelope names the org and plan.
-            with _fileperms.open_owner_only(self._cache_path, "w", encoding="utf-8") as fh:
+            # newline pinned: state files are LF on every platform (#3698).
+            with _fileperms.open_owner_only(
+                self._cache_path, "w", encoding="utf-8", newline="\n"
+            ) as fh:
                 fh.write(json.dumps(self._license_info.to_dict(), indent=2))
         except OSError:
             logger.warning("Could not save license cache to %s", self._cache_path)
