@@ -3973,7 +3973,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # multi-worker factory get the same guarantee.
     from headroom.proxy.bind_policy import enforce_bind_policy
 
-    enforce_bind_policy(getattr(config, "host", None), _proxy_token)
+    _bind_decision = enforce_bind_policy(getattr(config, "host", None), _proxy_token)
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
@@ -4105,6 +4105,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import (
+        is_container_host_gateway,
+    )
+    from headroom.proxy.loopback_guard import (
         require_loopback as _require_loopback,
     )
     from headroom.proxy.loopback_guard import (
@@ -4135,15 +4138,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         client = getattr(request, "client", None)
         return bool(_proxy_token) and not is_loopback_host(getattr(client, "host", None))
 
+    def _is_host_of_loopback_published_container(request: Request) -> bool:
+        """True for the host's own dashboard reaching a loopback-published container.
+
+        Docker relays a ``127.0.0.1:<port>`` publication into the container from
+        the bridge gateway, so the host browser's TCP peer is that gateway, not
+        127.0.0.1. The shipped launchers acknowledge their token-less 0.0.0.0
+        bind only together with that loopback publication, so under the
+        acknowledgement the gateway peer can only be a process on the host.
+        Matches the exact TCP peer (never a forwarded header, never another
+        container on the bridge) and keeps the loopback Host check.
+        """
+        if not (_bind_decision.open_bind and _bind_decision.acknowledged):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        return is_container_host_gateway(peer) and is_loopback_host_header(
+            request.headers.get("host")
+        )
+
     def _require_operator_read_client(request: Request) -> None:
         """Gate the read-only operator routes (history, quota, subscription window).
 
-        A token-authenticated operator on a public bind is entitled to them.
-        Everyone else falls back to the /settings* trust chain: loopback, or a
-        trusted dashboard client behind a gateway. Settings *writes*
-        deliberately do not get the token short-cut.
+        A token-authenticated operator on a public bind is entitled to them, as
+        is the host of a loopback-published container. Everyone else falls back
+        to the /settings* trust chain: loopback, or a trusted dashboard client
+        behind a gateway. Settings *writes* deliberately do not get either
+        short-cut.
         """
-        if _authenticated_at_gate(request):
+        if _authenticated_at_gate(request) or _is_host_of_loopback_published_container(request):
             return
         _require_loopback_or_trusted_dashboard_client(request)
 

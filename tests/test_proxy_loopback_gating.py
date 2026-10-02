@@ -828,6 +828,68 @@ def test_dashboard_shell_is_not_gated() -> None:
     assert client.get("/stats-history").status_code == 404
 
 
+def _acknowledged_container_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """A token-less 0.0.0.0 bind acknowledged as published on host loopback,
+    running in a container whose bridge gateway is 172.17.0.1."""
+    monkeypatch.setenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", "1")
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    return create_app(
+        ProxyConfig(
+            host="0.0.0.0",
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+    )
+
+
+@pytest.mark.parametrize("path", ["/stats-history", "/quota", "/subscription-window"])
+def test_loopback_published_container_serves_dashboard_data_to_its_host(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Host browser -> 127.0.0.1 publication -> container sees the bridge gateway."""
+    app = _acknowledged_container_app(monkeypatch)
+    host = TestClient(app, base_url="http://localhost:8787", client=("172.17.0.1", 1))
+    assert host.get(path).status_code != 404
+
+
+@pytest.mark.parametrize(
+    "client,base_url,headers",
+    [
+        # Another container on the same bridge is not the host.
+        (("172.17.0.5", 1), "http://127.0.0.1:8787", {}),
+        # The trust is the TCP peer; a forwarded header naming the gateway is ignored.
+        (("172.17.0.5", 1), "http://127.0.0.1:8787", {"X-Forwarded-For": "172.17.0.1"}),
+        # The DNS-rebinding defence still applies to the gateway peer.
+        (("172.17.0.1", 1), "http://attacker.example:8787", {}),
+    ],
+)
+def test_loopback_published_container_trust_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    client: tuple[str, int],
+    base_url: str,
+    headers: dict[str, str],
+) -> None:
+    app = _acknowledged_container_app(monkeypatch)
+    resp = TestClient(app, base_url=base_url, client=client).get("/stats-history", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_container_gateway_needs_the_open_bind_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the launcher's acknowledgement nothing vouches for the publication."""
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    client = TestClient(_make_app(), base_url="http://localhost:8787", client=("172.17.0.1", 1))
+    assert client.get("/stats-history").status_code == 404
+
+
 def test_stats_history_csv_export_not_served_to_network_callers() -> None:
     """The CSV export is the whole spend/model/session history in one GET."""
     resp = TestClient(_make_app()).get("/stats-history", params={"format": "csv"})
