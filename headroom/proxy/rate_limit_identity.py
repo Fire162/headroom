@@ -23,7 +23,9 @@ The rule now:
    trusted when it presented the proxy token (the security gate records that on
    ``request.state``) or came directly from loopback. A trusted-gateway peer is
    trusted to report the caller's address, not to vouch that the caller
-   authenticated, so forwarded requests without the token are untrusted.
+   authenticated, so forwarded requests without the token are untrusted. A
+   direct request from a gateway address that forwards no client address is
+   judged like any other direct request.
 3. For an **untrusted** request (no token configured and a remote caller) the
    credential is ignored: the bucket is the peer. Rotating a header cannot mint
    a new bucket for someone the proxy cannot authenticate.
@@ -37,6 +39,7 @@ import secrets
 from typing import Any
 
 from headroom.proxy.forwarded_headers import load_trusted_gateway_cidrs, resolve_client_ip
+from headroom.proxy.forwarded_policy import peer_is_trusted_gateway
 from headroom.proxy.loopback_guard import is_loopback_host
 
 # Set by the security gate when a caller presented a valid HEADROOM_PROXY_TOKEN.
@@ -76,18 +79,18 @@ def _credential(headers: Any) -> str | None:
     return None
 
 
-def _direct_peer_is_trusted_gateway(request: Any) -> bool:
+def _relayed_by_trusted_gateway(request: Any) -> bool:
+    """True when a trusted-gateway peer forwarded a client address for this request.
+
+    Any ``X-Forwarded-For`` value counts, even one the forwarded-header policy
+    cannot use, so a relayed request is never mistaken for a direct one.
+    """
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None
-    if not host:
+    if not host or not peer_is_trusted_gateway(host, load_trusted_gateway_cidrs()):
         return False
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    return any(addr in net for net in load_trusted_gateway_cidrs())
+    headers = getattr(request, "headers", None)
+    return bool(headers is not None and headers.get("x-forwarded-for"))
 
 
 def is_trusted_request(request: Any) -> bool:
@@ -95,12 +98,14 @@ def is_trusted_request(request: Any) -> bool:
 
     A request relayed by a trusted gateway (even one on loopback) is keyed by
     the forwarded client address unless it presented the proxy token: the
-    gateway vouches for that address, not for the caller's credential.
+    gateway vouches for that address, not for the caller's credential. A direct
+    request from a loopback gateway address, with no forwarded client address,
+    is still a direct loopback caller.
     """
     state = getattr(request, "state", None)
     if state is not None and getattr(state, PROXY_AUTHENTICATED_STATE_ATTR, False):
         return True
-    if _direct_peer_is_trusted_gateway(request):
+    if _relayed_by_trusted_gateway(request):
         return False
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None

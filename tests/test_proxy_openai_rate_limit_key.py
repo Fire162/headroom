@@ -211,3 +211,31 @@ def test_authenticated_caller_behind_trusted_gateway_gets_one_bucket_per_credent
             client, path, body, {**headers, "api-key": "key-A"}, {**headers, "api-key": "key-B"}
         )
     assert (first.status_code, second.status_code) == (200, 200)
+
+
+@pytest.mark.parametrize("endpoint", [CHAT, RESPONSES], ids=["chat", "responses"])
+def test_loopback_gateway_config_direct_and_forwarded_callers(monkeypatch, endpoint) -> None:
+    """One loopback gateway CIDR: direct callers stay per credential, relayed ones per client.
+
+    Direct loopback callers (no ``X-Forwarded-For``) with distinct keys keep
+    distinct buckets. A caller relayed through the same loopback gateway with a
+    fixed forwarded address cannot rotate keys into a fresh bucket.
+    """
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
+    path, body, upstream_body = endpoint
+    forwarded = {"x-forwarded-for": "203.0.113.9"}
+    with TestClient(create_app(_config()), client=("127.0.0.1", 1)) as client:
+        client.app.state.proxy._retry_request = AsyncMock(
+            side_effect=lambda *a, **k: httpx.Response(200, json=upstream_body)
+        )
+        statuses = [
+            client.post(path, headers=headers, json=body).status_code
+            for headers in (
+                {"api-key": "direct-A"},
+                {"api-key": "direct-B"},
+                {**forwarded, "api-key": "rotated-A"},
+                {**forwarded, "api-key": "rotated-B"},
+            )
+        ]
+    assert statuses == [200, 200, 200, 429]

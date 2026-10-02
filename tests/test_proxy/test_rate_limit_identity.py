@@ -77,7 +77,25 @@ def test_trusted_gateway_peer_alone_does_not_authenticate_the_caller(monkeypatch
 
 def test_loopback_gateway_does_not_authenticate_forwarded_callers(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
-    keyed = {"authorization": "Bearer k1"}
+    keyed = {"authorization": "Bearer k1", "x-forwarded-for": "203.0.113.9"}
+    assert rate_limit_identity(_request("127.0.0.1", headers=keyed)) == "peer:203.0.113.9"
+
+
+def test_loopback_gateway_config_keeps_direct_loopback_callers_per_credential(
+    monkeypatch,
+) -> None:
+    """A loopback gateway CIDR only matters for requests that forward a client address."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
+    a = rate_limit_identity(_request("127.0.0.1", headers={"authorization": "Bearer k1"}))
+    b = rate_limit_identity(_request("127.0.0.1", headers={"authorization": "Bearer k2"}))
+    assert a != b
+    assert a.startswith("peer:127.0.0.1|cred:") and b.startswith("peer:127.0.0.1|cred:")
+
+
+def test_unusable_forwarded_address_still_counts_as_relayed(monkeypatch) -> None:
+    """A gateway-relayed request with an empty leftmost hop is not a direct caller."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "127.0.0.0/8")
+    keyed = {"authorization": "Bearer k1", "x-forwarded-for": ", 203.0.113.9"}
     assert "|cred:" not in rate_limit_identity(_request("127.0.0.1", headers=keyed))
 
 
