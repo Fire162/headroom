@@ -4155,7 +4155,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         * a non-loopback caller that authenticated at the security gate;
         * loopback (peer *and* Host header, the usual two gates);
-        * a peer inside ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS`` or the
+        * a connecting peer inside ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS``
+          (whatever it forwards), or a resolved client inside the
           dashboard-client CIDRs, provided any browser provenance it carries
           is same-origin (a scraper sends neither Origin nor Referer).
 
@@ -4171,10 +4172,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             resolve_client_ip,
         )
 
-        peer = resolve_client_ip(request)
-        if peer and (
-            peer_is_trusted_gateway(peer, load_trusted_gateway_cidrs())
-            or peer_is_trusted_gateway(peer, trusted_dashboard_client_cidrs)
+        # Gateway CIDRs describe the TCP peer itself, never a forwarded address;
+        # only the dashboard-client CIDRs apply to the resolved client.
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        if peer_is_trusted_gateway(peer, load_trusted_gateway_cidrs()) or peer_is_trusted_gateway(
+            resolve_client_ip(request), trusted_dashboard_client_cidrs
         ):
             host_header = request.headers.get("host")
             if host_header and _request_has_same_origin_or_no_provenance(request, host_header):

@@ -884,6 +884,34 @@ def test_metrics_trusted_cidr_peer_outside_range_still_404s(
     assert client.get("/metrics").status_code == 404
 
 
+def test_metrics_trusted_gateway_forwarding_an_outside_scraper_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway CIDRs vouch for the connecting peer, not the forwarded scraper."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"X-Forwarded-For": "192.0.2.8"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_metrics_forwarded_gateway_address_from_untrusted_peer_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming a gateway-CIDR address in X-Forwarded-For grants nothing."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.10.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"X-Forwarded-For": "10.9.0.7"})
+    assert resp.status_code == 404
+
+
 def test_metrics_trusted_cidr_cross_origin_browser_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
