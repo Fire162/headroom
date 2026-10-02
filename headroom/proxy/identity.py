@@ -30,6 +30,10 @@ class IdentityResolver(Protocol):
 _resolver: IdentityResolver | None = None
 
 
+class UnresolvedPrincipalError(LookupError):
+    """An installed identity resolver could not establish a principal."""
+
+
 def set_identity_resolver(resolver: IdentityResolver | None) -> None:
     """Install (or clear) a custom identity resolver — the enterprise hook."""
     global _resolver
@@ -47,14 +51,16 @@ def resolve_authenticated_principal(request: Any) -> str | None:
     principals (e.g. the response cache) combine this with the caller's own
     provider credential rather than trusting the default identity.
 
-    An exception from the installed resolver propagates: the caller cannot
-    tell "no principal" from "principal unknown", so it must decide how to
-    fail closed rather than silently share data across principals.
+    An installed resolver that raises, or returns no principal, means the
+    principal is unknown rather than absent: this raises so the caller fails
+    closed instead of silently sharing data across principals.
     """
     if _resolver is None:
         return None
     principal = _resolver(request, default="")
-    return principal or None
+    if not principal:
+        raise UnresolvedPrincipalError("identity resolver returned no principal")
+    return principal
 
 
 def _default_os_user() -> str:

@@ -76,10 +76,10 @@ def compute_cache_partition(
 def compute_request_cache_partition(request: Any) -> str | None:
     """Partition for a live proxy request: credentials + authenticated principal.
 
-    Returns ``None`` when an installed identity resolver raises. The caller
-    must then bypass the response cache (no lookup, no store): falling back to
-    the credential-only partition would let tenants sharing one operator key
-    read each other's cached responses.
+    Returns ``None`` when an installed identity resolver raises or returns no
+    principal. The caller must then bypass the response cache (no lookup, no
+    store): falling back to the credential-only partition would let tenants
+    sharing one operator key read each other's cached responses.
     """
     from headroom.proxy.identity import resolve_authenticated_principal
 
@@ -87,7 +87,8 @@ def compute_request_cache_partition(request: Any) -> str | None:
         principal = resolve_authenticated_principal(request)
     except Exception:
         logger.warning(
-            "Identity resolver failed; bypassing the response cache for this request",
+            "Identity resolver could not establish a principal; "
+            "bypassing the response cache for this request",
             exc_info=True,
         )
         return None

@@ -1393,7 +1393,11 @@ class AnthropicHandlerMixin:
             # caller presenting the same provider credentials and principal (01-F15).
             # Snapshotted with the key fields so lookup and store agree. None means
             # the principal could not be established: skip the cache entirely.
-            cache_partition = compute_request_cache_partition(request)
+            # Only resolved when the cache can be used, so streaming and
+            # cache-disabled requests never pay for identity resolution.
+            cache_partition = (
+                compute_request_cache_partition(request) if self.cache and not stream else None
+            )
             # Check cache (non-streaming only)
             cache_hit = False
             if self.cache and not stream and cache_partition is not None:

@@ -111,12 +111,12 @@ async def test_semantic_cache_isolates_partitions() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _client() -> TestClient:
+def _client(*, cache_enabled: bool = True) -> TestClient:
     return TestClient(
         create_app(
             ProxyConfig(
                 optimize=False,
-                cache_enabled=True,
+                cache_enabled=cache_enabled,
                 rate_limit_enabled=False,
                 cost_tracking_enabled=False,
                 log_requests=False,
@@ -253,13 +253,29 @@ def _failing_resolver(request, *, default):  # noqa: ANN001
     raise RuntimeError("identity backend unavailable")
 
 
-def test_failing_identity_resolver_yields_no_partition() -> None:
-    identity.set_identity_resolver(_failing_resolver)
+def _empty_resolver(request, *, default):  # noqa: ANN001
+    # Installed, but cannot establish a principal for this caller.
+    return ""
+
+
+UNRESOLVED_RESOLVERS = pytest.mark.parametrize(
+    "resolver", [_failing_resolver, _empty_resolver], ids=["raises", "empty"]
+)
+
+
+@UNRESOLVED_RESOLVERS
+def test_failing_identity_resolver_yields_no_partition(resolver) -> None:  # noqa: ANN001
+    identity.set_identity_resolver(resolver)
     try:
         request = SimpleNamespace(headers={"x-api-key": "shared-operator-key"})
         assert compute_request_cache_partition(request) is None
     finally:
         identity.set_identity_resolver(None)
+
+
+def test_no_installed_resolver_keeps_the_credential_partition() -> None:
+    request = SimpleNamespace(headers={"x-api-key": "shared-operator-key"})
+    assert compute_request_cache_partition(request) == compute_cache_partition(request.headers)
 
 
 @pytest.mark.parametrize(
@@ -280,10 +296,18 @@ def test_failing_identity_resolver_yields_no_partition() -> None:
     ],
     ids=["anthropic", "openai"],
 )
-def test_failing_identity_resolver_bypasses_the_response_cache(path, body, reply, headers) -> None:
-    # A resolver that raises must not collapse tenants on one operator key into
-    # the credential-only partition: the cache is neither read nor written.
-    identity.set_identity_resolver(_failing_resolver)
+@UNRESOLVED_RESOLVERS
+def test_failing_identity_resolver_bypasses_the_response_cache(
+    resolver,  # noqa: ANN001
+    path,  # noqa: ANN001
+    body,  # noqa: ANN001
+    reply,  # noqa: ANN001
+    headers,  # noqa: ANN001
+) -> None:
+    # A resolver that raises or returns no principal must not collapse tenants
+    # on one operator key into the credential-only partition: the cache is
+    # neither read nor written.
+    identity.set_identity_resolver(resolver)
     try:
         with _client() as client:
             proxy = client.app.state.proxy
@@ -302,5 +326,38 @@ def test_failing_identity_resolver_bypasses_the_response_cache(path, body, reply
             assert "answer 1" not in texts[1] and "answer 2" in texts[1]
             assert "answer 3" in texts[2]
             assert len(calls) == 3
+    finally:
+        identity.set_identity_resolver(None)
+
+
+@pytest.mark.parametrize(
+    "path,body,reply,headers",
+    [
+        ("/v1/messages", ANTHROPIC_BODY, _anthropic_reply, {"x-api-key": "k"}),
+        ("/v1/chat/completions", OPENAI_BODY, _openai_reply, {"authorization": "Bearer k"}),
+    ],
+    ids=["anthropic", "openai"],
+)
+def test_cache_disabled_requests_skip_identity_resolution(path, body, reply, headers) -> None:
+    # No response cache means no partition is needed, so the (possibly
+    # remote) identity resolver must not be consulted for it.
+    resolved: list[str] = []
+
+    def _counting_resolver(request, *, default):  # noqa: ANN001
+        resolved.append("x")
+        return "alice"
+
+    identity.set_identity_resolver(_counting_resolver)
+    try:
+        with _client(cache_enabled=False) as client:
+            proxy = client.app.state.proxy
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                return reply("ok")
+
+            proxy._retry_request = _fake_retry
+            extra = {"anthropic-version": "2023-06-01"} if path == "/v1/messages" else {}
+            assert client.post(path, headers={**headers, **extra}, json=body).status_code == 200
+        assert resolved == []
     finally:
         identity.set_identity_resolver(None)
