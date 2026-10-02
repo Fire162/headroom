@@ -100,12 +100,59 @@ class TestConnectPrivateSqlite:
                 assert _mode(tmp_path / sidecar) == 0o600
         conn.close()
 
-    def test_memory_and_uri_pass_through_without_creating_files(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("name", "uri"),
+        [
+            (":memory:", False),
+            ("", False),
+            (":memory:", True),
+            ("file::memory:?cache=shared", True),
+            ("file:mem?mode=memory&cache=shared", True),
+        ],
+    )
+    def test_in_memory_databases_create_no_files(self, tmp_path, monkeypatch, name, uri):
         monkeypatch.chdir(tmp_path)
-        fileperms.connect_private_sqlite(":memory:").close()
-        fileperms.connect_private_sqlite("file:mem?mode=memory&cache=shared", uri=True).close()
+        fileperms.connect_private_sqlite(name, uri=uri).close()
         # No file literally named ":memory:" (a bug another store has shipped).
         assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("uri_for", "created"),
+        [
+            # Relative, percent-encoded, with an explicit create mode.
+            (lambda d: "file:my%20memory.db?mode=rwc", "my memory.db"),
+            (lambda d: f"file:{d}/abs.db", "abs.db"),
+            (lambda d: f"file://localhost{d}/host.db?cache=shared", "host.db"),
+        ],
+        ids=["relative-percent-encoded", "absolute", "localhost-authority"],
+    )
+    def test_file_backed_uri_is_private(self, tmp_path, monkeypatch, uri_for, created):
+        monkeypatch.chdir(tmp_path)
+        conn = fileperms.connect_private_sqlite(uri_for(tmp_path), uri=True)
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+        conn.close()
+        # Under the forced 022 umask sqlite alone would have made this 0644.
+        assert _mode(tmp_path / created) == 0o600
+
+    def test_file_prefixed_literal_path_is_private(self, tmp_path, monkeypatch):
+        # Without uri=True sqlite treats "file:..." as an ordinary file name.
+        monkeypatch.chdir(tmp_path)
+        conn = fileperms.connect_private_sqlite("file:literal.db")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+        conn.close()
+        assert _mode(tmp_path / "file:literal.db") == 0o600
+
+    def test_read_only_uri_does_not_create_missing_db(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(sqlite3.OperationalError):
+            fileperms.connect_private_sqlite("file:missing.db?mode=ro", uri=True)
+        assert not (tmp_path / "missing.db").exists()
+
+    def test_uri_with_remote_authority_is_refused(self):
+        with pytest.raises(PermissionError):
+            fileperms.connect_private_sqlite("file://otherhost/srv/m.db", uri=True)
 
     def test_refuses_symlinked_db(self, tmp_path):
         target = tmp_path / "victim.db"

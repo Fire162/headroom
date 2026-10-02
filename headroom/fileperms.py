@@ -52,6 +52,7 @@ import sqlite3
 import stat
 from pathlib import Path
 from typing import IO, Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 #: Mode for every runtime file Headroom creates that may hold request content.
 OWNER_ONLY_MODE = 0o600
@@ -116,6 +117,7 @@ def open_owner_only(
     *,
     encoding: str | None = None,
     errors: str | None = None,
+    newline: str | None = None,
 ) -> IO[Any]:
     """Open *path* for append (``"a"``) or write (``"w"``), creating it owner-only.
 
@@ -129,7 +131,7 @@ def open_owner_only(
     fd = os.open(path, _open_flags(truncate=mode.startswith("w")), OWNER_ONLY_MODE)
     try:
         restrict_fd_to_owner(fd)
-        return open(fd, mode, encoding=encoding, errors=errors, closefd=True)
+        return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
     except BaseException:
         try:
             os.close(fd)
@@ -191,10 +193,35 @@ def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> 
         os.close(fd)
 
 
-def _is_sqlite_uri_or_memory(path: str | os.PathLike[str]) -> bool:
-    """``:memory:`` and ``file:`` URIs are not filesystem paths to make private."""
+def _sqlite_file_path(path: str | os.PathLike[str], *, uri: bool) -> str | None:
+    """The file sqlite will create or open for *path*; ``None`` if there is none.
+
+    Mirrors sqlite's own rules. Without ``uri=True`` the name is a literal
+    path, even one that starts with ``file:``. With it, a ``file:`` URI names
+    its percent-decoded path (relative to the working directory unless
+    absolute), and is in-memory when that path is empty or ``:memory:`` or the
+    query says ``mode=memory``. ``mode=ro`` / ``mode=rw`` never create the
+    file, so a missing one is left for sqlite to report.
+    """
     text = os.fspath(path)
-    return text == ":memory:" or text.startswith("file:")
+    if text in ("", ":memory:"):
+        return None
+    if not (uri and text.startswith("file:")):
+        return text
+    if not OWNER_ONLY_SUPPORTED:
+        # No mode bits to set (module docstring), and Windows URIs carry a
+        # drive letter sqlite strips its own way: pass them through.
+        return None
+    parts = urlsplit(text)
+    file_path = unquote(parts.path)
+    mode = parse_qs(parts.query).get("mode", [""])[-1]
+    if file_path in ("", ":memory:") or mode == "memory":
+        return None
+    if parts.netloc not in ("", "localhost"):
+        raise PermissionError(f"refusing SQLite URI with a remote authority: {text}")
+    if mode in ("ro", "rw") and not os.path.lexists(file_path):
+        return None
+    return file_path
 
 
 def connect_private_sqlite(
@@ -206,13 +233,15 @@ def connect_private_sqlite(
     """``sqlite3.connect`` that first makes the database file owner-only.
 
     Drop-in for ``sqlite3.connect(str(path), **kwargs)`` at every store that
-    holds conversation-derived content. ``:memory:`` databases and ``file:``
-    URIs (``uri=True``) are passed straight through — they are not paths this
-    module should create. The parent directory must already exist; create it
-    with :func:`private_dir` if it is dedicated to this store.
+    holds conversation-derived content. In-memory databases are passed
+    straight through; a file-backed ``file:`` URI (``uri=True``) has its
+    underlying file made private like a plain path. The parent directory must
+    already exist; create it with :func:`private_dir` if it is dedicated to
+    this store.
     """
-    if not (connect_kwargs.get("uri") or _is_sqlite_uri_or_memory(path)):
-        ensure_private_file(path, what=what)
+    file_path = _sqlite_file_path(path, uri=bool(connect_kwargs.get("uri")))
+    if file_path is not None:
+        ensure_private_file(file_path, what=what)
     # ``**connect_kwargs: Any`` makes mypy type the call as ``Any``; the
     # annotation pins it back to the real return type.
     conn: sqlite3.Connection = sqlite3.connect(os.fspath(path), **connect_kwargs)
