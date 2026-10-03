@@ -57,14 +57,18 @@ Examples:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
+
+if TYPE_CHECKING:
+    from .config import MessageDecision
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +170,13 @@ class CompressConfig:
     """Round-trip each compressed message and revert any that is not provably
     lossless (keeps the original for that message). Forced on when
     ``mode='agent'``. Sets :attr:`CompressResult.lossless`."""
+    diagnostics: bool = False
+    """Collect per-message compression decisions.  Also enabled by the
+    ``HEADROOM_DIAGNOSTICS=1`` environment variable.  When True, the returned
+    :class:`CompressResult` carries a ``diagnostics`` list of
+    :class:`~headroom.config.MessageDecision` objects — one per message —
+    describing which action was taken (compressed, protected, skipped …) and
+    how many tokens were spent before/after."""
 
 
 @dataclass
@@ -195,6 +206,7 @@ class CompressResult:
     reverted_messages: int = 0
     """Messages reverted to their original form because their compression could
     not be verified lossless. Only meaningful when verification ran."""
+    diagnostics: list[MessageDecision] | None = None
 
 
 def compress(
@@ -253,6 +265,8 @@ def compress(
     if cfg.savings_profile:
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
+    collect_diagnostics = cfg.diagnostics or os.environ.get("HEADROOM_DIAGNOSTICS", "") == "1"
+
     agent_mode = cfg.mode == "agent"
     if agent_mode:
         # Live-agent regime: densify losslessly, never remove. Disable the ML
@@ -268,12 +282,17 @@ def compress(
     try:
         # Compute biases from hooks if provided
         biases = None
+        # Hard per-message veto. Separate from ``biases`` because a bias is a
+        # soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        protect = None
         if hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             ctx = CompressContext(model=model)
             messages = hooks.pre_compress(messages, ctx)
             biases = hooks.compute_biases(messages, ctx)
+            protect = collect_protected(hooks, messages, ctx)
 
         received_event = pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
@@ -300,6 +319,7 @@ def compress(
             model_limit=model_limit,
             context=context,
             biases=biases,
+            protect=protect,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
             compress_system_messages=cfg.compress_system_messages,
@@ -309,6 +329,7 @@ def compress(
             min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
             frozen_message_count=cfg.frozen_message_count,
+            collect_diagnostics=collect_diagnostics,
         )
 
         tokens_before = result.tokens_before
@@ -410,6 +431,7 @@ def compress(
             transforms_applied=result.transforms_applied,
             lossless=lossless,
             reverted_messages=reverted,
+            diagnostics=result.message_decisions if collect_diagnostics else None,
         )
 
     except Exception as e:
