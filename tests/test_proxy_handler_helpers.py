@@ -945,6 +945,50 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     ) == [{"role": "user", "content": [{"type": "text", "text": "hello\n\nctx"}]}]
 
 
+def test_append_context_skips_trailing_system_message() -> None:
+    # Claude Code 2.1.x request shape: the user turn is followed by a
+    # role="system" message carrying the environment and the cache breakpoint.
+    trailing_system = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    user_turn = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+            {"type": "text", "text": "question"},
+        ],
+    }
+    inject = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn
+
+    assert inject([user_turn, trailing_system], "memory", frozen_message_count=0) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<system-reminder>ctx</system-reminder>\n\nmemory"},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        trailing_system,
+    ]
+    # The user turn is still subject to the frozen prefix.
+    messages = [user_turn, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=1) is messages
+    # Skipping system messages never reaches past a non-user turn.
+    messages = [user_turn, {"role": "assistant", "content": "ok"}, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    # Tool-result-only turns have no text block to extend.
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]},
+        trailing_system,
+    ]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    messages = [trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+
+
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:
     image_message = {
         "role": "user",
@@ -1105,8 +1149,8 @@ def test_anthropic_assistant_message_helper_requires_assistant_role() -> None:
 # anthropic handler uses to scope the proactive-expansion cache by
 # project identity. The resolver shares its tier order with the memory
 # subsystem's ProjectResolver: x-headroom-project-id → x-headroom-cwd →
-# system-prompt `cwd:` line. Returns `("", None)` on no signal — the
-# fail-closed signal that callers gate on.
+# CLI override → system-prompt `cwd:` line. Returns `("", None)` on
+# no signal — the fail-closed signal that callers gate on.
 # ============================================================================
 
 
@@ -1157,6 +1201,38 @@ def test_resolve_ccr_workspace_two_cwds_get_distinct_keys() -> None:
         _fake_request({"x-headroom-cwd": "/home/user/code/tamag0"}), {}
     )
     assert key_a != key_b, "different cwds must yield different workspace keys"
+
+
+def test_resolve_ccr_workspace_project_label_alone_fails_closed() -> None:
+    """The savings label must not become a memory/CCR identity."""
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request({"x-headroom-project": "api"}), {}
+    )
+    assert key == ""
+    assert label is None
+
+
+def test_resolve_ccr_workspace_project_label_does_not_collapse_cwds() -> None:
+    """A user-supplied label cannot merge two distinct cwd identities."""
+    key_a, _ = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request(
+            {
+                "x-headroom-project": "api",
+                "x-headroom-cwd": "/work/acme/api",
+            }
+        ),
+        {},
+    )
+    key_b, _ = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request(
+            {
+                "x-headroom-project": "api",
+                "x-headroom-cwd": "/work/other/api",
+            }
+        ),
+        {},
+    )
+    assert key_a != key_b
 
 
 def test_resolve_ccr_workspace_no_signal_returns_empty() -> None:
