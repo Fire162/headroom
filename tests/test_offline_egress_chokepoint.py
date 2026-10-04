@@ -1060,6 +1060,62 @@ class TestSubscriptionPollersRefuseLegibly:
         assert "HEADROOM_OFFLINE" in (tracker._state.last_error or "")
 
 
+class TestDoctorNetworkOffline:
+    """`headroom doctor --network` and the TLS-error chain re-probe.
+
+    Both live in ``proxy/tls_diagnostics.py``: a certificate-chain handshake
+    plus an HTTP GET against hard-coded provider, HuggingFace and tiktoken
+    hosts, and the same chain handshake again on the request path whenever an
+    upstream fails TLS verification. Headroom opens every one of those
+    connections on its own initiative, so the air-gap switch refuses them.
+    """
+
+    def test_endpoint_check_refuses_before_any_connection(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        from headroom.proxy import tls_diagnostics
+
+        with pytest.raises(OfflineEgressBlocked) as caught:
+            tls_diagnostics.probe_endpoint(
+                "api.anthropic.com", "https://api.anthropic.com/v1/models"
+            )
+        assert _refused_hostname(caught.value) == "api.anthropic.com"
+
+    def test_doctor_reports_the_network_checks_as_skipped(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        from headroom.cli import doctor
+
+        rows = doctor.network_checks(["https://llm.internal.example/v1"])
+        assert [(row.name, row.status) for row in rows] == [("network", doctor.SKIP)]
+        assert "HEADROOM_OFFLINE" in rows[0].summary
+
+    def test_chain_probe_opens_no_socket(self, offline: None, no_sockets: None) -> None:
+        """Its own ``except Exception`` would hide a trapped connect as an
+        ordinary probe error, so assert on the reason, not on "no raise"."""
+        from headroom.proxy import tls_diagnostics
+
+        info = tls_diagnostics.probe_presented_chain(
+            "api.anthropic.com", use_cache=False, allow_private=True
+        )
+        assert info.reachable is False
+        assert (info.error or "").startswith("skipped: HEADROOM_OFFLINE")
+
+    def test_tls_failure_is_still_explained_without_the_reprobe(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        import ssl
+
+        from headroom.proxy import tls_diagnostics
+
+        exc = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        message = tls_diagnostics.describe_upstream_failure(
+            exc, "https://offline-reprobe.example/v1/messages"
+        )
+        assert message is not None
+        assert "could not verify the TLS certificate for offline-reprobe.example" in message
+
+
 class TestInstallDownloadsOffline:
     """`headroom install`'s two release downloads.
 

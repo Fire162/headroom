@@ -11,7 +11,9 @@ Langfuse export, HuggingFace/Kompress/fastembed model downloads, release-binary
 and codebase-memory-mcp downloads, eval dataset downloads and the provider SDK
 clients the eval harness drives, GitHub Copilot device-flow auth and token
 exchange, the Anthropic / Codex / Copilot subscription pollers, the OpenAI
-embedders, and both Headroom Cloud compression integrations.
+embedders, both Headroom Cloud compression integrations, and the TLS
+diagnostics (``doctor --network`` endpoint checks and the certificate-chain
+re-probe after an upstream TLS failure).
 
 Permitted, explicitly and by name — an air-gapped deployment needs these and
 none of them is Headroom phoning home:
