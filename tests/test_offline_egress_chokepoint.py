@@ -36,6 +36,7 @@ drifting apart is the failure mode a Python-only test suite cannot see.
 from __future__ import annotations
 
 import ast
+import ipaddress
 import os
 import re
 import socket
@@ -65,9 +66,23 @@ class SocketOpened(AssertionError):
     """
 
 
+def _is_loopback(address: object) -> bool:
+    """True for an ``(ip, port, ...)`` address whose IP literal is loopback.
+
+    IP literals only: a hostname such as ``localhost`` would need resolving,
+    and resolving is exactly what the trap must not take on trust.
+    """
+    if not isinstance(address, tuple) or not address or not isinstance(address[0], str):
+        return False
+    try:
+        return ipaddress.ip_address(address[0].split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
 @pytest.fixture
 def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make any attempt to open a TCP connection fail the test.
+    """Make any attempt to open an outbound TCP connection fail the test.
 
     We patch the three entry points that every client in this tree bottoms out
     in: ``socket.create_connection`` (urllib, httpcore's sync backend),
@@ -75,14 +90,81 @@ def no_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     else, including anyio's async backend). Creating a socket object is
     harmless — connecting is what leaves the box — so we trap the connect, not
     the constructor.
+
+    Connects to a loopback IP literal are let through, because they cannot
+    leave the box and the event loop itself makes one: on Windows,
+    ``asyncio.run()`` builds a Proactor loop whose self-pipe is a
+    ``socket.socketpair()``, and Windows implements that as a ``127.0.0.1``
+    listen + connect. Trapping it failed every async test while the loop was
+    being constructed, before any Headroom code ran.
     """
+    real_create_connection = socket.create_connection
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
 
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise SocketOpened(f"outbound connection attempted while offline: {args!r}")
+    def _refuse(address: object) -> None:
+        raise SocketOpened(f"outbound connection attempted while offline: {address!r}")
 
-    monkeypatch.setattr(socket, "create_connection", _boom)
-    monkeypatch.setattr(socket.socket, "connect", _boom)
-    monkeypatch.setattr(socket.socket, "connect_ex", _boom)
+    def _create_connection(address: object, *args: object, **kwargs: object) -> socket.socket:
+        if not _is_loopback(address):
+            _refuse(address)
+        return real_create_connection(address, *args, **kwargs)  # type: ignore[arg-type]
+
+    def _connect(self: socket.socket, address: object) -> None:
+        if not _is_loopback(address):
+            _refuse(address)
+        real_connect(self, address)  # type: ignore[arg-type]
+
+    def _connect_ex(self: socket.socket, address: object) -> int:
+        if not _is_loopback(address):
+            _refuse(address)
+        return real_connect_ex(self, address)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket, "create_connection", _create_connection)
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
+
+
+class TestSocketTrap:
+    """The trap itself: it must still catch egress, and must not catch the loop."""
+
+    def test_event_loop_wakeup_pipe_is_not_egress(
+        self, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reproduces the Windows failure on every platform.
+
+        ``socket._fallback_socketpair`` is the implementation Windows uses for
+        ``socket.socketpair()``: a loopback listen + connect. Forcing it makes
+        ``asyncio.run()`` build its self-pipe the way the Proactor loop does.
+        """
+        import asyncio
+
+        fallback = getattr(socket, "_fallback_socketpair", None)
+        if fallback is None:
+            pytest.skip("this Python has no socket._fallback_socketpair")
+        monkeypatch.setattr(socket, "socketpair", fallback)
+
+        async def nothing() -> str:
+            return "ran"
+
+        assert asyncio.run(nothing()) == "ran"
+
+    @pytest.mark.parametrize("address", [("192.0.2.1", 443), ("2001:db8::1", 443)])
+    def test_an_outbound_connect_is_still_caught(
+        self, no_sockets: None, address: tuple[str, int]
+    ) -> None:
+        family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            with pytest.raises(SocketOpened):
+                sock.connect(address)
+            with pytest.raises(SocketOpened):
+                sock.connect_ex(address)
+        with pytest.raises(SocketOpened):
+            socket.create_connection(address, timeout=0.01)
+
+    def test_a_hostname_is_not_trusted_as_loopback(self, no_sockets: None) -> None:
+        with pytest.raises(SocketOpened):
+            socket.create_connection(("localhost", 9), timeout=0.01)
 
 
 @pytest.fixture
