@@ -21,7 +21,17 @@ import pytest
 from headroom.install import paths as install_paths
 from headroom.install import state as install_state
 from headroom.install import supervisors
-from headroom.install.paths import OWNER_ONLY_SCRIPT_MODE, chmod_owner_only
+from headroom.install.paths import (
+    OWNER_ONLY_SCRIPT_MODE,
+    POSIX_MODES_ENFORCED,
+    chmod_owner_only,
+)
+
+# Windows governs access with ACLs; chmod there cannot establish these modes, so
+# asserting the bits would test the platform rather than the code.
+posix_modes_only = pytest.mark.skipif(
+    not POSIX_MODES_ENFORCED, reason="POSIX mode bits are not enforced on this platform"
+)
 
 
 def _raise_oserror(*_args, **_kwargs):
@@ -29,6 +39,7 @@ def _raise_oserror(*_args, **_kwargs):
 
 
 class TestChmodOwnerOnlyReportsItsResult:
+    @posix_modes_only
     def test_returns_true_and_narrows_an_existing_file(self, tmp_path):
         target = tmp_path / "run-headroom.sh"
         target.write_text("export ANTHROPIC_API_KEY=sk-live\n")
@@ -91,12 +102,33 @@ class TestRunnerScriptsFailClosed:
 
         assert target.read_text() == "echo hi\n"
 
+    @posix_modes_only
+    def test_rewriting_an_old_script_never_writes_secrets_at_its_old_mode(
+        self, tmp_path, monkeypatch
+    ):
+        """``O_TRUNC`` keeps an existing inode's mode, so rewriting a 0755
+        script in place would put the key in a world-readable file until the
+        chmod ran. The new content must land in a file created owner-only --
+        proven here by taking the after-the-fact chmod away."""
+        target = tmp_path / "run-headroom.sh"
+        target.write_text("#!/usr/bin/env bash\n")
+        os.chmod(target, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        monkeypatch.setattr(supervisors, "chmod_owner_only", lambda *_a: True)
+
+        supervisors._write_private_text(
+            target, "export ANTHROPIC_API_KEY=sk-live\n", OWNER_ONLY_SCRIPT_MODE
+        )
+
+        assert target.read_text() == "export ANTHROPIC_API_KEY=sk-live\n"
+        assert stat.S_IMODE(target.stat().st_mode) == OWNER_ONLY_SCRIPT_MODE
+
     def test_a_writable_script_keeps_working(self, tmp_path):
         target = tmp_path / "run-headroom.sh"
         supervisors._write_private_text(target, "echo hi\n", OWNER_ONLY_SCRIPT_MODE)
 
         assert target.read_text() == "echo hi\n"
-        assert stat.S_IMODE(target.stat().st_mode) == OWNER_ONLY_SCRIPT_MODE
+        if POSIX_MODES_ENFORCED:
+            assert stat.S_IMODE(target.stat().st_mode) == OWNER_ONLY_SCRIPT_MODE
 
 
 class TestManifestWarnsButPersists:
@@ -104,7 +136,11 @@ class TestManifestWarnsButPersists:
         """The manifest is born 0600 from ``mkstemp``, so a directory that could
         not be narrowed weakens the outer layer without exposing the file --
         warn, but do not abandon the deployment."""
-        monkeypatch.setenv("HOME", str(tmp_path))
+        # Patch the deployment root itself, not HOME: Windows resolves the
+        # home directory without consulting $HOME, so a HOME-only patch writes
+        # this fixture key into the real user's default profile.
+        deploy = tmp_path / "deploy"
+        monkeypatch.setattr("headroom.install.paths._paths.deploy_root", lambda: deploy)
         monkeypatch.setattr(install_state, "POSIX_MODES_ENFORCED", True)
 
         real_chmod = os.chmod
@@ -133,6 +169,8 @@ class TestManifestWarnsButPersists:
             install_state.save_manifest(manifest)
 
         path = install_state.manifest_path("default")
+        assert path.parent.parent == deploy, f"{path} escaped the test deployment root"
         assert path.exists(), "a warning must not cost the operator their manifest"
-        assert stat.S_IMODE(path.stat().st_mode) == install_paths.OWNER_ONLY_FILE_MODE
+        if POSIX_MODES_ENFORCED:
+            assert stat.S_IMODE(path.stat().st_mode) == install_paths.OWNER_ONLY_FILE_MODE
         assert any("not owner-only" in r.getMessage() for r in caplog.records)

@@ -14,7 +14,11 @@ import sys
 from pathlib import Path
 
 import pytest
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,21 +60,22 @@ def test_lean_profile_stays_torch_free() -> None:
     )
 
 
-def test_security_policy_supported_versions_match_the_shipped_version() -> None:
+def test_security_policy_supports_the_latest_release_without_a_version_number() -> None:
     """SECURITY.md's table sat at 0.27.x while the code shipped 0.38.0.
 
     A supported-versions table that lags is worse than none: it tells a reporter
-    their release is unsupported when it is the current one.
+    their release is unsupported when it is the current one. The policy now
+    supports "the latest release on PyPI", which cannot go stale; pin that, and
+    fail if a hard-coded version row (the thing that rotted) comes back.
     """
-    version = _pyproject()["project"]["version"]
-    series = ".".join(version.split(".")[:2]) + ".x"
-
     text = (_ROOT / "SECURITY.md").read_text(encoding="utf-8")
-    assert f"| {series} (latest) |" in text, (
-        f"SECURITY.md does not list {series} as the supported series "
-        f"(pyproject version is {version})"
+    table = text.split("## Supported Versions", 1)[1].split("\n## ", 1)[0]
+
+    assert re.search(r"^\| Latest release on PyPI \| :white_check_mark: +\|$", table, re.M), (
+        "SECURITY.md must list the latest PyPI release as the supported version"
     )
-    assert f"| < {series} |" in text, f"SECURITY.md does not mark < {series} unsupported"
+    pinned = re.findall(r"^\|[^|]*\d+\.\d+(?:\.x)?[^|]*\|", table, re.M)
+    assert not pinned, f"SECURITY.md pins a version number that will go stale: {pinned}"
 
 
 def test_security_policy_does_not_claim_blanket_no_credential_storage() -> None:
@@ -126,7 +131,7 @@ def _claimed_mode(pattern: re.Pattern[str]) -> int:
     return int(match.group(1), 8)
 
 
-def _install_with_a_provider_key(home: Path) -> tuple[Path, Path, Path]:
+def _install_with_a_provider_key(deploy: Path) -> tuple[Path, Path, Path]:
     """Run the real planner/state/supervisor path with a key in ``--env``.
 
     Returns the profile directory, its manifest and its foreground runner
@@ -138,7 +143,7 @@ def _install_with_a_provider_key(home: Path) -> tuple[Path, Path, Path]:
     from headroom.install.state import save_manifest
     from headroom.install.supervisors import render_runner_scripts
 
-    assert Path.home() == home, "the fake HOME monkeypatch did not take effect"
+    assert profile_root("default").parent == deploy, "the deploy-root monkeypatch did not take"
 
     manifest = build_manifest(
         profile="default",
@@ -176,9 +181,13 @@ def test_install_env_persists_a_provider_key_exactly_as_the_policy_describes(
     policy may not claim keys are never written. Pin both halves: that the key
     lands where SECURITY.md says, and that it lands owner-only.
     """
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Patch the deployment root itself, not HOME: Windows resolves the home
+    # directory without consulting $HOME, so a HOME-only patch writes this
+    # fixture key into the real user's profile.
+    deploy = tmp_path / "deploy"
+    monkeypatch.setattr("headroom.install.paths._paths.deploy_root", lambda: deploy)
 
-    profile_dir, manifest_file, run_script = _install_with_a_provider_key(tmp_path)
+    profile_dir, manifest_file, run_script = _install_with_a_provider_key(deploy)
 
     # 1. What lands on disk. Both files carry the key in cleartext; the runner
     #    script `export`s it because launchd/systemd hand the process nothing.
