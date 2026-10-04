@@ -83,14 +83,21 @@ def _load_text_embedding(kwargs: dict[str, str]) -> TextEmbedding:
     never sent somewhere it would not otherwise go.
     """
     from fastembed import TextEmbedding
+    from huggingface_hub import constants as hf_constants
 
+    # huggingface_hub reads HF_HUB_OFFLINE once, at import, into
+    # ``constants.HF_HUB_OFFLINE``; if it was imported before this call the
+    # env var alone changes nothing. Force both.
     previous = os.environ.get("HF_HUB_OFFLINE")
+    previous_constant = hf_constants.HF_HUB_OFFLINE
     os.environ["HF_HUB_OFFLINE"] = "1"
+    hf_constants.HF_HUB_OFFLINE = True
     try:
         return TextEmbedding(**kwargs)
     except Exception as cache_miss:  # noqa: BLE001 - any local-lookup failure
         logger.debug("fastembed cache lookup failed, falling back to network: %s", cache_miss)
     finally:
+        hf_constants.HF_HUB_OFFLINE = previous_constant
         if previous is None:
             os.environ.pop("HF_HUB_OFFLINE", None)
         else:

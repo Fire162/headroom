@@ -753,29 +753,128 @@ class TestModelLoadersDegradeExplicitly:
         assert "HEADROOM_OFFLINE" in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
 
-    def test_the_onnx_candidate_loop_stops_at_the_refusal(
-        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    def test_the_onnx_candidate_loop_refuses_once_then_checks_the_cache(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch, caplog
     ) -> None:
-        """The loader tries four ONNX filenames in turn. A refusal applies to
-        all four, so it must be terminal — otherwise the operator gets the same
-        warning four times and a closing ``FileNotFoundError`` that says
-        nothing about the air-gap."""
+        """The loader tries several ONNX filenames in turn. A refusal for the
+        first says nothing about the rest, so they are still looked up — but
+        cache-only, so the refusal is logged once and never retried."""
         import huggingface_hub
         from huggingface_hub.errors import LocalEntryNotFoundError
 
         from headroom.transforms import kompress_compressor
 
-        attempts: list[str] = []
+        attempts: list[tuple[str, bool]] = []
 
         def fake_download(repo_id, filename, *, revision=None, local_files_only=False):
-            attempts.append(filename)
+            attempts.append((filename, local_files_only))
             raise LocalEntryNotFoundError("cold cache")
 
         monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-        with pytest.raises(kompress_compressor.KompressModelNotCached):
+        with (
+            caplog.at_level("WARNING"),
+            pytest.raises(kompress_compressor.KompressModelNotCached) as excinfo,
+        ):
             kompress_compressor._create_onnx_session("acme/model", [], allow_download=True)
-        # One candidate tried (the cache probe plus the refused network call).
-        assert len(set(attempts)) == 1
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert [f for f, _ in attempts] == list(kompress_compressor._onnx_filename_candidates())
+        assert all(local for _, local in attempts), "nothing may reach the network path"
+        assert caplog.text.count("HEADROOM_OFFLINE forbids fetching it") == 1
+
+    def test_a_cached_fallback_candidate_still_loads_offline(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Devin: the first candidate uncached must not hide a cached second one."""
+        import sys
+
+        import huggingface_hub
+
+        from headroom.transforms import kompress_compressor
+
+        first, second = kompress_compressor._onnx_filename_candidates()[:2]
+
+        def fake_download(repo_id, filename, *, revision=None, local_files_only=False):
+            if filename == second:
+                return f"/cache/{filename}"
+            # A plain OSError rather than LocalEntryNotFoundError: conftest
+            # turns the latter into a skip, which would hide a regression here.
+            raise OSError("cold cache")
+
+        loaded: list[str] = []
+
+        def fake_session(path, *args, **kwargs):
+            loaded.append(path)
+            return SimpleNamespace(path=path)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+        monkeypatch.setitem(
+            sys.modules, "onnxruntime", SimpleNamespace(InferenceSession=fake_session)
+        )
+        monkeypatch.setattr(kompress_compressor, "_onnx_session_options", lambda ort: None)
+        monkeypatch.setattr(kompress_compressor, "_smoke_run", lambda session: None)
+
+        session = kompress_compressor._create_onnx_session("acme/model", [], allow_download=True)
+        assert session.path == f"/cache/{second}"
+        assert loaded == [f"/cache/{second}"]
+
+    def test_an_uncached_tokenizer_is_refused_not_fetched(
+        self, offline: None, no_sockets: None
+    ) -> None:
+        """Devin: cached weights plus an uncached ModernBERT tokenizer fell
+        through to ``from_pretrained(local_files_only=False)`` unguarded."""
+        from headroom.transforms import kompress_compressor
+
+        calls: list[bool] = []
+
+        class _AutoTokenizer:
+            @staticmethod
+            def from_pretrained(name: str, *, local_files_only: bool) -> object:
+                calls.append(local_files_only)
+                if local_files_only:
+                    raise OSError("not cached")
+                raise SocketOpened(f"would fetch {name} from the Hub")
+
+        with pytest.raises(kompress_compressor.KompressModelNotCached) as excinfo:
+            kompress_compressor._load_modernbert_tokenizer(_AutoTokenizer, allow_download=True)
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert calls == [True]
+
+    @pytest.mark.parametrize(
+        ("loader", "missing", "flag"),
+        [
+            ("_load_classifier", "tokenizer.json", "_classifier_session"),
+            ("_load_siglip", "text_embeddings.npz", "_siglip_session"),
+        ],
+    )
+    def test_the_image_router_is_not_left_half_loaded(
+        self,
+        offline: None,
+        no_sockets: None,
+        monkeypatch: pytest.MonkeyPatch,
+        loader: str,
+        missing: str,
+        flag: str,
+    ) -> None:
+        """Devin: the session doubles as the "loaded" flag, so publishing it
+        before a later artifact is refused left a router that never retried."""
+        import sys
+
+        from headroom.image import onnx_router
+
+        def fake_artifact(repo: str, filename: str) -> str:
+            if filename == missing:
+                raise RuntimeError("not cached and HEADROOM_OFFLINE forbids fetching it")
+            return f"/cache/{filename}"
+
+        monkeypatch.setattr(onnx_router, "_hf_artifact", fake_artifact)
+        monkeypatch.setitem(
+            sys.modules, "onnxruntime", SimpleNamespace(InferenceSession=lambda *a, **k: object())
+        )
+        monkeypatch.setattr(onnx_router, "create_cpu_session_options", lambda *a, **k: None)
+        router = onnx_router.OnnxTechniqueRouter()
+        with pytest.raises(RuntimeError):
+            getattr(router, loader)()
+        assert getattr(router, flag) is None
 
     def test_a_warm_cache_is_unaffected(
         self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
@@ -1248,6 +1347,30 @@ class TestEvalDownloadsOffline:
         assert _refused_hostname(excinfo.value) == "huggingface.co"
 
 
+class TestEvalRunnerLocalProvider:
+    """Devin: the before/after runner refused its local Ollama provider."""
+
+    def test_ollama_is_not_refused(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+
+        from headroom.evals.runners.before_after import BeforeAfterRunner, LLMConfig
+
+        monkeypatch.setitem(sys.modules, "ollama", SimpleNamespace(Client=lambda: "ollama"))
+        runner = BeforeAfterRunner.__new__(BeforeAfterRunner)
+        runner.llm_config = LLMConfig(provider="ollama")
+        assert runner._init_llm_client() == "ollama"
+
+    def test_a_hosted_provider_is_still_refused(self, offline: None, no_sockets: None) -> None:
+        from headroom.evals.runners.before_after import BeforeAfterRunner, LLMConfig
+
+        runner = BeforeAfterRunner.__new__(BeforeAfterRunner)
+        runner.llm_config = LLMConfig(provider="openai")
+        with pytest.raises(OfflineEgressBlocked):
+            runner._init_llm_client()
+
+
 class TestHeadroomCloudCompressionOffline:
     """Both Headroom Cloud integrations.
 
@@ -1380,6 +1503,30 @@ class TestFastembedWeightsOffline:
         self._fake_fastembed(monkeypatch, cached=True)
         embedding._load_text_embedding({"model_name": "m"})
         assert os.environ["HF_HUB_OFFLINE"] == "0"
+
+    def test_an_already_imported_hub_is_forced_offline_too(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Devin: huggingface_hub reads HF_HUB_OFFLINE once, at import. If it
+        was imported while the variable was unset, flipping the env var alone
+        leaves the Hub online for the "cache-only" attempt."""
+        import sys
+
+        from huggingface_hub import constants as hf_constants
+
+        from headroom.relevance import embedding
+
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
+
+        class _TextEmbedding:
+            def __init__(self, **kwargs: object) -> None:
+                if not hf_constants.HF_HUB_OFFLINE:
+                    raise SocketOpened("cache-only attempt would have reached the Hub")
+
+        monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=_TextEmbedding))
+        assert embedding._load_text_embedding({"model_name": "m"}) is not None
+        assert hf_constants.HF_HUB_OFFLINE is False, "the constant must be restored"
 
     def test_the_scorer_reports_a_model_not_an_air_gap_type(
         self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch

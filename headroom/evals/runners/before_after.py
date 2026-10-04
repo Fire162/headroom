@@ -96,9 +96,13 @@ class BeforeAfterRunner:
         self._judge_fn: Any = None
 
     def _init_llm_client(self) -> Any:
-        """Initialize the appropriate LLM client."""
-        guard_egress(f"{self.llm_config.provider} API for the before/after eval runner")
+        """Initialize the appropriate LLM client.
+
+        Ollama is not guarded: like the Ollama embedder it is an
+        operator-configured endpoint that defaults to localhost.
+        """
         if self.llm_config.provider == "anthropic":
+            guard_egress("anthropic API for the before/after eval runner")
             try:
                 import anthropic
 
@@ -108,6 +112,7 @@ class BeforeAfterRunner:
                     "anthropic package required. Install with: pip install anthropic"
                 ) from e
         elif self.llm_config.provider == "openai":
+            guard_egress("openai API for the before/after eval runner")
             try:
                 import openai
 

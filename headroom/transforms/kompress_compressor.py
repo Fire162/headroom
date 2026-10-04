@@ -28,7 +28,7 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
-from ..offline import OFFLINE_ENV, OfflineEgressBlocked
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
@@ -769,16 +769,19 @@ def _create_onnx_session(
     """
     last_err: Exception | None = None
     cache_miss = False
+    refused: KompressModelNotCached | None = None
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = _hf_artifact(model_id, filename, allow_network=allow_download)
-        except KompressModelNotCached:
-            # Only _hf_artifact's air-gap translation raises this here, and it
-            # is terminal for the whole loop: every remaining candidate would be
-            # refused for the same reason, so trying them just logs the same
-            # refusal four times and ends on a misleading FileNotFoundError.
-            raise
+            onnx_path = _hf_artifact(
+                model_id, filename, allow_network=allow_download and refused is None
+            )
+        except KompressModelNotCached as exc:
+            # Only _hf_artifact's air-gap translation raises this here. It says
+            # THIS candidate is not cached; a later one may be. Keep looking,
+            # cache-only, so the refusal is logged once and never retried.
+            refused = exc
+            continue
         except Exception as exc:
             last_err = exc
             cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
@@ -804,6 +807,8 @@ def _create_onnx_session(
                 model_id,
                 exc,
             )
+    if refused is not None:
+        raise refused
     if not allow_download and cache_miss:
         raise KompressModelNotCached(model_id) from last_err
     raise FileNotFoundError(
@@ -888,7 +893,18 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-    # Genuine cache miss and downloading is permitted: fetch it.
+    # Genuine cache miss and downloading is permitted: fetch it, unless the
+    # air-gap forbids it — translated exactly as _hf_artifact does.
+    try:
+        guard_egress("Kompress tokenizer download", "huggingface.co/answerdotai/ModernBERT-base")
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: the ModernBERT tokenizer is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached("answerdotai/ModernBERT-base") from blocked
     return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
 
 

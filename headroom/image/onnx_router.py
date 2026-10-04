@@ -118,8 +118,15 @@ class OnnxTechniqueRouter:
 
         logger.info("Loading technique-router ONNX INT8...")
 
+        # Resolve every artifact before publishing anything: the session is the
+        # "loaded" flag, so setting it before a later artifact fails (e.g. not
+        # cached under HEADROOM_OFFLINE) would leave a half-loaded router that
+        # never retries.
         model_path = _hf_artifact(_TECHNIQUE_ROUTER_REPO, "model_quantized.onnx")
-        self._classifier_session = ort.InferenceSession(
+        tokenizer_path = _hf_artifact(_TECHNIQUE_ROUTER_REPO, "tokenizer.json")
+        config_path = _hf_artifact(_TECHNIQUE_ROUTER_REPO, "config.json")
+
+        session = ort.InferenceSession(
             model_path,
             create_cpu_session_options(
                 ort,
@@ -129,18 +136,18 @@ class OnnxTechniqueRouter:
             providers=["CPUExecutionProvider"],
         )
 
-        tokenizer_path = _hf_artifact(_TECHNIQUE_ROUTER_REPO, "tokenizer.json")
-        self._tokenizer = Tokenizer.from_file(tokenizer_path)
-        self._tokenizer.enable_truncation(max_length=64)
-        self._tokenizer.enable_padding(length=64)
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        tokenizer.enable_truncation(max_length=64)
+        tokenizer.enable_padding(length=64)
 
         # Load label mapping
         import json
 
-        config_path = _hf_artifact(_TECHNIQUE_ROUTER_REPO, "config.json")
         with open(config_path) as f:
             config = json.load(f)
         self._id2label = {int(k): v for k, v in config.get("id2label", {}).items()}
+        self._tokenizer = tokenizer
+        self._classifier_session = session
 
         logger.info(
             f"Technique router loaded: {len(self._id2label)} classes, "
@@ -156,16 +163,18 @@ class OnnxTechniqueRouter:
 
         logger.info("Loading SigLIP ONNX INT8 image encoder...")
 
+        # Both artifacts first, session last — see _load_classifier.
         model_path = _hf_artifact(_SIGLIP_ENCODER_REPO, "image_encoder_int8.onnx")
-        self._siglip_session = ort.InferenceSession(
+        embeddings_path = _hf_artifact(_SIGLIP_ENCODER_REPO, "text_embeddings.npz")
+
+        session = ort.InferenceSession(
             model_path,
             create_cpu_session_options(ort),
             providers=["CPUExecutionProvider"],
         )
-
-        embeddings_path = _hf_artifact(_SIGLIP_ENCODER_REPO, "text_embeddings.npz")
         loaded = np.load(embeddings_path)
         self._text_embeddings = {k: loaded[k] for k in loaded.files}
+        self._siglip_session = session
 
         logger.info(
             f"SigLIP image encoder loaded: ONNX INT8 "
