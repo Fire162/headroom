@@ -1645,9 +1645,10 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
     API. Lets us tell a Headroom bug (wrong host / integration-id / token kind)
     apart from an upstream entitlement 400.
 
-    Records only the host + URL + fixed credential labels (scheme + token type
-    prefix). No token bytes and no request headers are written or logged — the
-    auth header is reduced to constant labels via prefix tests, never a slice.
+    Records only the host + URL path + fixed credential labels (scheme + token
+    type prefix). URL userinfo, query and fragment are dropped. No token bytes
+    and no request headers are written or logged — the auth header is reduced
+    to constant labels via prefix tests, never a slice.
     (The integration-id / editor-version a request carries are surfaced by the
     read-only doctor's reconstruction instead.)
     """
@@ -1673,9 +1674,15 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
                 if rest.startswith(known):
                     token_label = known + "***"
                     break
+        # Keep only scheme, hostname, port and path: userinfo, query and fragment can
+        # carry credentials, and must not reach the file or the log.
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
         record = {
-            "host": urlparse(url).netloc,
-            "url": url,
+            "host": host,
+            "url": f"{parsed.scheme}://{host}{parsed.path}",
             "auth_scheme": scheme_label,
             "token_kind": token_label,
         }

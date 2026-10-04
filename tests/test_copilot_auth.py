@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -1527,6 +1528,42 @@ def test_capture_outbound_redacts_token(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert rec["token_kind"] == "tid_***"  # masked label only
     assert "token_prefix" not in rec
     assert rec["host"] == "api.enterprise.githubcopilot.com"
+
+
+def test_capture_outbound_drops_url_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Userinfo, query and fragment can carry credentials: neither sink may keep them."""
+
+    out = tmp_path / "cap.jsonl"
+    monkeypatch.setenv("HEADROOM_COPILOT_DEBUG_OUTBOUND", "1")
+    monkeypatch.setenv("HEADROOM_COPILOT_DEBUG_OUTBOUND_FILE", str(out))
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(level=logging.WARNING)
+    handler.emit = records.append  # type: ignore[method-assign]
+    copilot_auth.logger.addHandler(handler)
+    try:
+        asyncio.run(
+            copilot_auth.apply_copilot_api_auth(
+                {"authorization": "Bearer tid_abc"},
+                url=(
+                    "https://user:USERINFO_SECRET@api.githubcopilot.com:8443/chat/completions"
+                    "?access_token=SYNTHETIC_URL_SECRET#FRAGMENT_SECRET"
+                ),
+            )
+        )
+    finally:
+        copilot_auth.logger.removeHandler(handler)
+
+    body = out.read_text()
+    logged = "\n".join(r.getMessage() for r in records if "[copilot-outbound]" in r.getMessage())
+    rec = json.loads(body.strip().splitlines()[-1])
+    assert rec["host"] == "api.githubcopilot.com:8443"
+    assert rec["url"] == "https://api.githubcopilot.com:8443/chat/completions"
+    assert "https://api.githubcopilot.com:8443/chat/completions" in logged
+    for secret in ("USERINFO_SECRET", "SYNTHETIC_URL_SECRET", "FRAGMENT_SECRET", "user:"):
+        assert secret not in body
+        assert secret not in logged
 
 
 def test_capture_outbound_disabled_by_default(
