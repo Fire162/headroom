@@ -51,19 +51,28 @@ print(" HEADROOM × COPILOT — PHASE B (live proxy through-path)")
 print(f" host = {HOST}   port = {PORT}")
 print("=" * 64)
 
+base = f"http://127.0.0.1:{PORT}"
+try:
+    httpx.get(f"{base}/health", timeout=2)
+except httpx.TransportError:
+    pass  # nothing listening — the port is free for the test proxy
+else:
+    raise SystemExit(f"port {PORT} is already in use — stop that server or set HR_TEST_PORT")
+
 proc = subprocess.Popen(
     [HEADROOM_BIN, "proxy", "--port", str(PORT), "--no-rate-limit"],
     env=env,
     stdout=open("/tmp/hr_enterprise_proxy.log", "w"),
     stderr=subprocess.STDOUT,
 )
-base = f"http://127.0.0.1:{PORT}"
 rows: list[tuple[str, int, str]] = []
 try:
     # wait for readiness
     ready = False
     with httpx.Client(timeout=2) as c:
         for _ in range(60):
+            if proc.poll() is not None:
+                break  # the test proxy exited (e.g. failed to bind) — never probe another server
             try:
                 if c.get(f"{base}/health").status_code == 200:
                     ready = True

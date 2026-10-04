@@ -31,7 +31,8 @@ GITHUB_COPILOT_API_URL=https://api.business.githubcopilot.com \
 ```
 
 Look for:
-- **[4] host type** = `ENTERPRISE / data-residency` *(business host)*; **[5] exchange** should now return a `tid_` (it 404s on unentitled seats).
+- **[4] host type** = `ENTERPRISE / data-residency` *(business host)*; **[4] api token** kind should be `tid_(exchanged)` (the exchange 404s on unentitled seats).
+- **[5]** shows the headers Headroom would forward (token kind + integration ID), with no token bytes.
 - **[6] catalog** lists premium models; **[7]** shows `gpt-5.5` / `claude` as `✅` (via `chat` or `responses`).
 - If `[7]` is `🔒 403` → SSO authorization needed (re-login via IdP).
 - If `[7]` premium is `❌ 400` → models **not enabled in org policy** (Step 0.2).
@@ -83,7 +84,8 @@ Look for token savings attributed to the `copilot` provider on the dashboard.
 ## What to send back (no secrets)
 
 The full stdout of Step A and Step B (tokens are already redacted to prefixes/kind),
-plus `~/.headroom/copilot_outbound.jsonl` (host + headers + token *kind* only).
+plus the Step B capture `/tmp/hr_enterprise_capture.jsonl` (host + URL path + token *kind* only;
+with the env flag set outside the harness it defaults to `~/.headroom/copilot_outbound.jsonl`).
 
 ## Cleanup
 
@@ -94,7 +96,7 @@ unset HEADROOM_COPILOT_DEBUG_OUTBOUND          # stop outbound capture
 
 ---
 
-### Kit contents (currently uncommitted)
+### Kit contents
 - `tools/copilot-test/copilot_doctor.py` — Phase A, read-only diagnostic
 - `tools/copilot-test/enterprise_proxy_test.py` — Phase B, live-proxy through-path
 - Outbound capture hook lives in `headroom/copilot_auth.py` (env-gated `HEADROOM_COPILOT_DEBUG_OUTBOUND`)

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -37,6 +38,7 @@ REASONING = ("gpt-5", "o1", "o3")  # these need /responses, not /chat/completion
 PROBE = ["gpt-4o", "gpt-5.5", "claude-sonnet-4.6"]
 # GitHub token TYPE prefixes — these are not secret (the random bytes after are).
 TOKEN_PREFIXES = ("github_pat_", "gho_", "ghu_", "ghs_", "ghp_", "tid_")
+_TOKEN_RE = re.compile(r"\b(" + "|".join(TOKEN_PREFIXES) + r")[^\s\"',;]+")
 
 
 def redact(t: str | None) -> str:
@@ -59,7 +61,8 @@ def status_msg(r: httpx.Response) -> tuple[int, str]:
     msg = (er.get("message") if isinstance(er, dict) else er) or (
         "OK" if r.status_code == 200 else r.text[:40]
     )
-    return r.status_code, str(msg)[:46]
+    # Upstream errors can echo a credential — keep only its type prefix.
+    return r.status_code, _TOKEN_RE.sub(r"\1…", str(msg))[:46]
 
 
 print("=" * 64)
@@ -145,11 +148,12 @@ except Exception as e:  # noqa: BLE001
     print(f"    capture error: {e}")
 
 # [6] Catalog ---------------------------------------------------------------
+# Same identity headers (incl. integration ID) the token above was minted for —
+# GitHub rejects a token presented under a different integration ID.
 hdr = {
+    **copilot_auth._copilot_chat_header_defaults(),
     "Authorization": f"Bearer {api_token}",
     "Content-Type": "application/json",
-    "Copilot-Integration-Id": "vscode-chat",
-    "Editor-Version": "vscode/1.107.0",
 }
 head("[6] /models catalog (what the picker SHOWS)")
 if api_token:
@@ -180,24 +184,27 @@ if api_token:
             return c.post(f"{api_url}/{path}", headers=hdr, json=payload)
 
     for m in PROBE:
-        sc, msg = status_msg(
-            post(
-                "chat/completions",
-                {
-                    "model": m,
-                    "messages": [{"role": "user", "content": "reply OK"}],
-                    "max_tokens": 8,
-                },
+        try:
+            sc, msg = status_msg(
+                post(
+                    "chat/completions",
+                    {
+                        "model": m,
+                        "messages": [{"role": "user", "content": "reply OK"}],
+                        "max_tokens": 8,
+                    },
+                )
             )
-        )
-        used = "chat"
-        # reasoning models often 400 on chat but work on /responses (the #644/#647 wire-API split)
-        if sc == 400 and any(m.startswith(k) for k in REASONING):
-            sc2, msg2 = status_msg(post("responses", {"model": m, "input": "reply OK"}))
-            if sc2 != 400:
-                sc, msg, used = sc2, msg2, "responses"
-            else:
-                used = "chat+responses (both 400)"
+            used = "chat"
+            # reasoning models often 400 on chat but work on /responses (#644/#647 wire-API split)
+            if sc == 400 and any(m.startswith(k) for k in REASONING):
+                sc2, msg2 = status_msg(post("responses", {"model": m, "input": "reply OK"}))
+                if sc2 != 400:
+                    sc, msg, used = sc2, msg2, "responses"
+                else:
+                    used = "chat+responses (both 400)"
+        except Exception as e:  # noqa: BLE001 — one bad probe must not stop the rest
+            sc, msg, used = -1, f"request error: {type(e).__name__}", "error"
         results[m] = sc
         endpoint_used[m] = used
         sso = sso or sc == 403
@@ -238,7 +245,7 @@ print(
     f"    Credential found    : {cands[0].source if cands else 'NONE — discovery gap (run where the token lives, or use env/pass-through)'}"
 )
 print(
-    f"    Token forwarded     : {'tid_ session' if (api_token or '').startswith('tid_') else 'gho_ OAuth (direct, no exchange)'}"
+    f"    Token forwarded     : {'none' if not api_token else ('tid_ session' if api_token.startswith('tid_') else 'OAuth (direct, no exchange)')}"
 )
 print(f"    API host            : {api_url}")
 print(
