@@ -114,3 +114,36 @@ def test_tokenizer_loader_floats_when_pin_disabled(monkeypatch):
 
     kc._load_modernbert_tokenizer(_Tok, allow_download=True)
     assert calls[0]["revision"] is None
+
+
+def test_cache_only_pytorch_load_does_not_fetch_encoder(monkeypatch):
+    # A cache-only load must not download the pinned encoder on the request
+    # path; a missing snapshot defers the load like any other cache miss.
+    import sys
+    import types
+
+    from headroom.transforms import kompress_compressor as kc
+
+    calls: list[dict] = []
+
+    class _AutoModel:
+        @staticmethod
+        def from_pretrained(repo, **kwargs):
+            calls.append(kwargs)
+            if kwargs.get("local_files_only"):
+                raise OSError("pinned encoder snapshot not cached")
+            raise AssertionError("cache-only load reached the network")
+
+    nn = types.SimpleNamespace(Module=object)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(nn=nn))
+    monkeypatch.setitem(sys.modules, "torch.nn", nn)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoModel=_AutoModel, AutoTokenizer=object),
+    )
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+
+    with pytest.raises(kc.KompressModelNotCached):
+        kc._load_kompress_pytorch("chopratejas/kompress-v2-base", allow_download=False)
+    assert [c["local_files_only"] for c in calls] == [True]

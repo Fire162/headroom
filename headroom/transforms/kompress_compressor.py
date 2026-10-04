@@ -601,14 +601,21 @@ def _get_model_class() -> type:
     class HeadroomCompressorModel(nn.Module):
         """Dual-head ModernBERT: token classification + span importance CNN."""
 
-        def __init__(self, model_name: str = "answerdotai/ModernBERT-base"):
+        def __init__(
+            self,
+            model_name: str = "answerdotai/ModernBERT-base",
+            *,
+            revision: str | None = None,
+            allow_download: bool = True,
+        ):
             super().__init__()
             # Same pin as the tokenizer: the fine-tuned heads were trained on
             # this encoder snapshot. Unknown repos resolve to None (floating).
             self.encoder = AutoModel.from_pretrained(
                 model_name,
                 attn_implementation="eager",
-                revision=_resolve_revision(model_name, None),
+                revision=_resolve_revision(model_name, revision),
+                local_files_only=not allow_download,
             )
             hidden_size = self.encoder.config.hidden_size  # 768
 
@@ -992,7 +999,12 @@ def _load_kompress_pytorch(
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
         HeadroomCompressorModel = _get_model_class()
-        model = HeadroomCompressorModel()
+        try:
+            model = HeadroomCompressorModel(allow_download=allow_download)
+        except _NOT_CACHED_ERRORS as exc:
+            if allow_download:
+                raise
+            raise KompressModelNotCached(_MODERNBERT_TOKENIZER_REPO) from exc
 
         _load_pytorch_weights(model, model_id, allow_download=allow_download)
 
