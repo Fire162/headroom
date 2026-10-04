@@ -18,10 +18,10 @@ stay in lockstep. The cell-encoding contract (post null/empty fix) is:
 ==================  ==========================  ============================
 Original value      Rendered cell               Decoded back to
 ==================  ==========================  ============================
-missing key         ``\\N`` (bare sentinel)      key omitted from the dict
-JSON ``null``       empty cell                  ``None``
+missing key         empty cell                  key omitted from the dict
+JSON ``null``       ``null`` (bare)             ``None``
 ``""`` (empty str)  ``""`` (quoted empty)       ``""``
-literal ``"\\N"``    ``"\\N"`` (quoted)           ``"\\N"``
+literal ``"null"``  ``"null"`` (quoted)         ``"null"``
 string w/ ``,"``\\n  CSV-quoted                  the string
 other string        bare                        the string
 number / bool       bare                        ``int``/``float``/``bool``
@@ -40,9 +40,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# Sentinel the formatter emits for an absent key (distinct from null's empty
-# cell). Kept in one place so the encoder (Rust) and this decoder agree.
-MISSING_SENTINEL = "\\N"
+# Bare cells the native formatter emits for an absent key and for JSON null.
+# The strings "" and "null" are always CSV-quoted, so neither is ambiguous.
+# Kept in one place so the encoder (Rust) and this decoder agree.
+MISSING_CELL = ""
+NULL_TOKEN = "null"
 
 # Scalar type tags the schema header can declare. ``json`` covers nested
 # objects/arrays and mixed-type columns.
@@ -145,8 +147,8 @@ def _iter_rows(blob: str) -> list[list[tuple[bool, str]]]:
     """Split CSV ``blob`` into rows of ``(was_quoted, value)`` cells.
 
     Hand-rolled rather than the ``csv`` module because we must preserve the
-    quoted-vs-bare distinction for *empty* cells (``""`` is an empty string;
-    a bare empty cell is null) — ``csv.reader`` collapses both to ``''``.
+    quoted-vs-bare distinction (``"null"`` is a string; bare ``null`` is JSON
+    null) — ``csv.reader`` does not report which cells were quoted.
     Quotes inside quoted fields are escaped by doubling, matching the Rust
     ``csv_quote``; newlines inside quotes are honored.
     """
@@ -198,11 +200,10 @@ def _iter_rows(blob: str) -> list[list[tuple[bool, str]]]:
 def _split_data_rows(blob: str, declared: int) -> list[list[tuple[bool, str]]]:
     """Return the CSV body's data rows, dropping only a trailing-newline artifact.
 
-    The formatter newline-terminates every row, so a single-column ``null`` row
-    renders as a bare empty line — a legitimate ``[(False, "")]`` row, NOT an
-    artifact. (Unconditionally skipping such rows silently dropped a trailing
-    single-column null; see regression test.) Only a lone empty cell that
-    EXCEEDS the declared row count is the trailing-newline artifact and is
+    The formatter newline-terminates every row, so a single-column row with a
+    missing key renders as a bare empty line — a legitimate ``[(False, "")]``
+    row, NOT an artifact. Only a lone empty cell that EXCEEDS the declared row
+    count is the trailing-newline artifact and is
     dropped; rows with no cells at all are always dropped.
     """
     rows = [r for r in _iter_rows(blob) if r]
@@ -219,11 +220,11 @@ def _decode_cell(was_quoted: bool, value: str, col: _Column) -> tuple[bool, Any]
                 return True, json.loads(value)
             except (ValueError, TypeError):
                 return True, value
-        return True, value  # quoted "" -> "", quoted "\N" -> "\N", etc.
-    if value == MISSING_SENTINEL:
+        return True, value  # quoted "" -> "", quoted "null" -> "null", etc.
+    if value == MISSING_CELL:
         return False, None
-    if value == "":
-        return True, None  # null
+    if value == NULL_TOKEN:
+        return True, None
     if col.type == "int":
         try:
             return True, int(value)
@@ -294,7 +295,7 @@ def factor_values(text: str) -> str:
             if j >= len(cells):
                 continue
             was_quoted, value = cells[j]
-            if not was_quoted and value in ("", MISSING_SENTINEL):
+            if not was_quoted and value in (NULL_TOKEN, MISSING_CELL):
                 continue  # null / missing stay inline
             # _iter_rows already unescaped quoted cells, so the logical string
             # value is `value` whether or not it was quoted on the wire.
@@ -335,7 +336,7 @@ def factor_values(text: str) -> str:
             if j >= len(cells):
                 break
             was_quoted, value = cells[j]
-            if j in index_maps and not (not was_quoted and value in ("", MISSING_SENTINEL)):
+            if j in index_maps and not (not was_quoted and value in (NULL_TOKEN, MISSING_CELL)):
                 rendered.append(str(index_maps[j][value]))
             else:
                 rendered.append(_render_raw(was_quoted, value))
@@ -396,10 +397,10 @@ def expand_compacted(text: str) -> list[dict[str, Any]] | None:
                 break
             was_quoted, value = cells[idx]
             if col.name in legends and not was_quoted:
-                # Dict-encoded cell: empty -> null, \N -> missing, else index.
-                if value == MISSING_SENTINEL:
+                # Dict-encoded cell: null -> None, empty -> missing, else index.
+                if value == MISSING_CELL:
                     continue
-                if value == "":
+                if value == NULL_TOKEN:
                     _assign(record, col.path, None)
                     continue
                 try:

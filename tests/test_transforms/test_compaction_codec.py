@@ -5,8 +5,8 @@ against *real* Rust SmartCrusher output so the encoder and decoder stay in
 lockstep:
 
 - losslessness of densification is programmatically verifiable (round-trip);
-- the null / empty-string / missing-key / literal ``\\N`` distinctions survive
-  (the defect the densifier previously collapsed);
+- the null / empty-string / missing-key / literal ``"null"`` distinctions
+  survive, matching the native formatter's encoding;
 - value-factoring dictionary-encodes low-cardinality columns reversibly and
   only when it saves bytes.
 """
@@ -48,6 +48,8 @@ def test_null_empty_missing_and_literal_backslash_n_are_distinct() -> None:
             records.append({"a": i, "b": i})  # missing key
         elif i == 3:
             records.append({"a": i, "b": i, "c": "\\N"})  # literal backslash-N
+        elif i == 4:
+            records.append({"a": i, "b": i, "c": "null"})  # literal string "null"
         else:
             records.append({"a": i, "b": i, "c": f"v{i}"})
     comp = _crush(records)
@@ -57,6 +59,7 @@ def test_null_empty_missing_and_literal_backslash_n_are_distinct() -> None:
     assert decoded[0]["c"] is None  # null
     assert decoded[1]["c"] == ""  # empty string
     assert decoded[3]["c"] == "\\N"  # literal preserved
+    assert decoded[4]["c"] == "null"  # quoted literal is a string, not null
     assert decoded == records
 
 
@@ -155,13 +158,13 @@ def test_value_factoring_handles_comma_and_quote_values() -> None:
     assert expand_compacted(factored) == records
 
 
-def test_single_column_null_row_is_not_dropped() -> None:
-    # Regression: a single-column `null` row renders as a bare empty line, which
-    # the decoder used to drop as a trailing-newline artifact — silently losing
-    # the row. The declared row count ([N]) disambiguates a real null row from a
-    # trailing artifact; literal `\N`, missing key, and null must all survive.
-    block = '[3]{k:string?}\n"\\N"\n\\N\n\n'
-    assert expand_compacted(block) == [{"k": "\\N"}, {}, {"k": None}]
+def test_single_column_missing_row_is_not_dropped() -> None:
+    # Native encoding: missing key is a bare empty cell, null is bare `null`,
+    # and "" / "null" are quoted. A trailing single-column missing row renders
+    # as a bare empty line; the declared row count keeps it from being dropped
+    # as a trailing-newline artifact.
+    block = '[4]{k:string?}\n""\nnull\n"null"\n\n'
+    assert expand_compacted(block) == [{"k": ""}, {"k": None}, {"k": "null"}, {}]
 
 
 def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
@@ -171,7 +174,7 @@ def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
 
 
 def test_single_column_null_survives_value_factoring() -> None:
-    block = "[3]{k:string?}\nx\ny\n\n"
+    block = "[3]{k:string?}\nx\ny\nnull\n"
     factored = factor_values(block)
     assert expand_compacted(factored) == expand_compacted(block)
     assert expand_compacted(factored) == [{"k": "x"}, {"k": "y"}, {"k": None}]
