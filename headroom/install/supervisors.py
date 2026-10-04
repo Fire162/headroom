@@ -59,11 +59,13 @@ def _write_private_text(path: Path, data: str, mode: int) -> None:
     put a provider API key there, so these files are secret-bearing. Creating
     the file with :func:`os.open` and an explicit mode — rather than writing
     first and chmod'ing after — closes the window in which a world-readable
-    file holding a live API key exists on disk. An existing file keeps its old
-    mode through ``O_TRUNC``, so chmod afterwards as well to narrow scripts
-    written by an earlier version.
+    file holding a live API key exists on disk. An existing file is removed
+    first, because ``O_TRUNC`` would keep its old (possibly 0755) mode while the
+    new secrets are written into it; the chmod afterwards still verifies the
+    result.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     # Newline handling is left at the default so the bytes written match what
     # `Path.write_text` produced before, on every platform.
