@@ -339,3 +339,87 @@ def test_a_failing_ml_call_still_draws_down_the_budget(charged, monkeypatch) -> 
     assert stub.calls > 0
     assert charged, "a raising call must still be billed"
     assert sum(charged) > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Second review: the FIRST ML call of a request was always admitted (the seed
+# rate was 0, and there is no measurement yet), and it is non-preemptible, so
+# one huge first block could still run past the ML budget and the executor
+# timeout. The call is now capped rather than estimated.
+# --------------------------------------------------------------------------- #
+
+
+class _CooperativeKompress(_SlowKompress):
+    """Behaves like Kompress under a time cap: stops at a chunk boundary once
+    ``_time_budget_cap_seconds`` is spent and returns the block unchanged."""
+
+    shares_request_deadline = True
+
+    def __init__(self, worst_case_s: float, chunk_s: float = 0.02) -> None:
+        super().__init__(per_call_s=worst_case_s)
+        self.chunk_s = chunk_s
+        self.caps: list[float | None] = []
+
+    def compress(self, text: str, **kwargs: object) -> _StubResult:
+        self.calls += 1
+        cap = kwargs.get("_time_budget_cap_seconds")
+        self.caps.append(cap)  # type: ignore[arg-type]
+        ends_at = None if cap is None else time.monotonic() + float(cap)  # type: ignore[arg-type]
+        spent = 0.0
+        while spent < self.per_call_s:
+            if ends_at is not None and time.monotonic() >= ends_at:
+                return _StubResult(compressed=text, compressed_tokens=cr._estimate_tokens(text))
+            time.sleep(self.chunk_s)
+            spent += self.chunk_s
+        out = text[: max(1, len(text) // 2)]
+        return _StubResult(compressed=out, compressed_tokens=cr._estimate_tokens(out))
+
+
+def test_first_ml_call_is_capped_by_the_budget_it_was_admitted_against(
+    charged, monkeypatch
+) -> None:
+    """A first block whose worst case (3s) exceeds both the outer timeout (1s)
+    and the ML budget derived from it (0.5s) must still stop inside the budget."""
+    monkeypatch.delenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", raising=False)
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "1")
+    budget = cr._ml_stage_deadline_seconds()
+    assert budget == 0.5
+
+    stub = _CooperativeKompress(worst_case_s=3.0)
+    monkeypatch.setattr(cr.ContentRouter, "_get_kompress", lambda self: stub)
+
+    _apply(cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True)))
+
+    assert stub.caps, "the first block must still reach the model"
+    first_cap = stub.caps[0]
+    assert first_cap is not None and 0.0 < first_cap <= budget, (
+        f"first call was not capped by the ML budget: {stub.caps}"
+    )
+    # One chunk of slack: the cap is checked at chunk boundaries, as in Kompress.
+    assert sum(charged) <= budget + 0.2, (
+        f"ML ran {sum(charged):.2f}s against a {budget}s budget under a 1s executor timeout"
+    )
+
+
+def test_blocks_refused_by_the_budget_pass_through_unchanged(monkeypatch) -> None:
+    """Not the size gate's lossy fallback: the refusal depends on the request,
+    the router caches the result, and only raw bytes stay the same on later
+    turns, so the prompt cache holds."""
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+    router._runtime_state_var.set(
+        cr._PerRequestRuntimeState(ml_budget_active=True, ml_elapsed=999.0)
+    )
+
+    class _Crusher:
+        def compress(self, text: str, context: str = "") -> _StubResult:
+            return _StubResult(compressed="crushed", compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_text_crusher", lambda: _Crusher())
+    stub = _SlowKompress(per_call_s=0.0)
+    monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+
+    text = _prose(2_000)
+    out, _ = router._try_ml_compressor(text, "")
+
+    assert out == text
+    assert stub.calls == 0

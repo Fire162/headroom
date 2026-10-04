@@ -171,11 +171,6 @@ def _estimate_tokens(text: str) -> int:
 #: is not preemptible, so the ceiling can only stop the NEXT call.
 _ML_STAGE_BUDGET_FRACTION = 0.5
 
-#: Projected seconds per estimated token for the first ML call of a process,
-#: before any real measurement exists. Only used to decide whether a block can
-#: start; every later projection uses this request's own observed worst case.
-_ML_SECONDS_PER_TOKEN_SEED = 0.0
-
 
 def _ml_stage_deadline_seconds() -> float:
     """Wall-clock ceiling for ALL ML (Kompress) work inside one request.
@@ -190,8 +185,10 @@ def _ml_stage_deadline_seconds() -> float:
     compression for every following request.
 
     So the guard has to match the budget's granularity: once this much time
-    has gone into ML for this request, remaining blocks take the same fallback
-    the size gate uses (TextCrusher / LogCompressor / passthrough).
+    has gone into ML for this request, remaining blocks pass through unchanged.
+    Raw rather than a cheaper lossy fallback: the router caches that verdict,
+    so the block keeps the same bytes on later turns and the prompt cache
+    holds.
 
     The point of the ceiling is to degrade to a partial compression *before*
     the executor abandons a non-preemptible worker, so it is worthless unless
@@ -4561,10 +4558,12 @@ class ContentRouter(Transform):
         # plausibly FINISH inside what is left.
         #
         # The projection uses the worst seconds-per-token this request has
-        # actually measured. The first block of a request has no measurement
-        # and is admitted on the seed rate (0 ⇒ admit): it is still bounded by
-        # the per-block token cap below and by the outer timeout, and refusing
-        # it would mean never compressing anything.
+        # actually measured. The first block of a request has no measurement,
+        # so it cannot be refused on one -- instead the call itself is capped:
+        # what is left of the budget goes to Kompress as its per-call time
+        # budget (below), and Kompress stops at the next chunk boundary when
+        # it runs out, returning the block unchanged. That holds for every
+        # call, so a projection that guessed low cannot overrun either.
         _ml_state = self._runtime_state_var.get()
         _ml_budget = _ml_stage_deadline_seconds() if _ml_state.ml_budget_active else 0.0
         _remaining = (_ml_budget - _ml_state.ml_elapsed) if _ml_budget > 0 else None
@@ -4574,7 +4573,7 @@ class ContentRouter(Transform):
         _block_tokens = -1
         _projected = 0.0
         if _remaining is not None and not _over_budget:
-            _rate = _ml_state.ml_seconds_per_token or _ML_SECONDS_PER_TOKEN_SEED
+            _rate = _ml_state.ml_seconds_per_token
             if _rate > 0.0:
                 _block_tokens = _estimate_tokens(text_to_compress)
                 _projected = _block_tokens * _rate
@@ -4585,22 +4584,26 @@ class ContentRouter(Transform):
                 _block_tokens = _estimate_tokens(text_to_compress)
             logger.info(
                 "ML stage budget spent (%.1fs of %.1fs used, ~%.1fs projected for a "
-                "~%d tok block, %.1fs left); routing remaining blocks off ML. "
-                "Partial compression beats a blown budget.",
+                "~%d tok block, %.1fs left); passing remaining blocks through "
+                "unchanged. Partial compression beats a blown budget.",
                 _ml_state.ml_elapsed,
                 _ml_budget,
                 _projected,
                 _block_tokens,
                 max(0.0, _remaining or 0.0),
             )
+            # Unchanged, not the size gate's lossy fallback below: this
+            # verdict depends on the request, not the content, and the router
+            # caches it, so the bytes must be ones it can keep sending on
+            # later turns without busting the prompt cache.
+            return content, _estimate_tokens(content)
 
-        if _over_budget or (
+        if (
             self._kompress_max_tokens > 0
             and _estimate_tokens(text_to_compress) > self._kompress_max_tokens
         ):
-            if not _over_budget:
-                self._kompress_gate_fires += 1
-                self._observe_kompress_size_gate("exceeded")
+            self._kompress_gate_fires += 1
+            self._observe_kompress_size_gate("exceeded")
             logger.info(
                 "kompress size-gate fired: ~%d tok (>%d) routed off ML (fire #%d)",
                 len(text_to_compress) // 4,
@@ -4691,6 +4694,13 @@ class ContentRouter(Transform):
                             compressor, "shares_request_deadline", False
                         ):
                             compress_kwargs["_deadline_started_at"] = deadline_origin
+                        # The ML budget's remainder caps THIS call, so the
+                        # first one of a request -- admitted without a measured
+                        # cost -- cannot run past the budget either.
+                        if _remaining is not None and getattr(
+                            compressor, "shares_request_deadline", False
+                        ):
+                            compress_kwargs["_time_budget_cap_seconds"] = _remaining
                         _ml_started = time.monotonic()
                         try:
                             result = compressor.compress(text_to_compress, **compress_kwargs)
