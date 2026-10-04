@@ -168,3 +168,51 @@ def test_verify_rejects_bool_int_conflation() -> None:
     assert _string_pair_is_lossless('[{"a":true}]', "[1]{a:int}\n1\n") is False
     # positive control: a faithful int round-trip is still accepted.
     assert _string_pair_is_lossless('[{"a":1}]', "[1]{a:int}\n1\n") is True
+
+
+def _count_messages(messages: list[dict]) -> int:
+    from headroom.compress import _get_agent_pipeline
+
+    return (
+        _get_agent_pipeline()._get_tokenizer("claude-sonnet-4-5-20250929").count_messages(messages)
+    )
+
+
+def _repeated_path_records() -> list[dict]:
+    paths = [f"./src/very/long/package/path/module_{k}/implementation_file.py" for k in range(3)]
+    return [{"path": paths[i % 3], "line": i, "text": f"hit {i}"} for i in range(40)]
+
+
+def test_tokens_after_counts_value_factored_messages() -> None:
+    res = headroom.densify(_tool_result_messages(_repeated_path_records()))
+    assert "__dict:" in res.messages[2]["content"][0]["content"]
+    assert res.reverted_messages == 0
+    assert res.tokens_after == _count_messages(res.messages)
+    assert res.tokens_saved == res.tokens_before - res.tokens_after
+
+
+def test_tokens_after_counts_reverted_messages(monkeypatch) -> None:
+    import importlib
+
+    # `headroom.compress` the attribute is the function; fetch the module.
+    compress_module = importlib.import_module("headroom.compress")
+    monkeypatch.setattr(compress_module, "_message_is_lossless", lambda orig, comp: False)
+    msgs = _tool_result_messages(_repeated_path_records())
+    res = headroom.densify(msgs)
+    assert res.reverted_messages == 1
+    assert res.messages == msgs
+    assert res.tokens_after == _count_messages(msgs)
+    assert res.tokens_saved == 0
+
+
+def test_new_fields_do_not_shift_positional_arguments() -> None:
+    # New fields go after `diagnostics` so existing positional construction
+    # still binds `diagnostics` where it did before this mode existed.
+    from dataclasses import fields
+
+    from headroom.compress import CompressConfig, CompressResult
+
+    config_names = [f.name for f in fields(CompressConfig)]
+    assert config_names[-3:] == ["diagnostics", "mode", "verify_lossless"]
+    result_names = [f.name for f in fields(CompressResult)]
+    assert result_names[-3:] == ["diagnostics", "lossless", "reverted_messages"]

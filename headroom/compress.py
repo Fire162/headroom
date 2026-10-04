@@ -151,6 +151,14 @@ class CompressConfig:
     savings_profile: str | None = None
     """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
+    diagnostics: bool = False
+    """Collect per-message compression decisions.  Also enabled by the
+    ``HEADROOM_DIAGNOSTICS=1`` environment variable.  When True, the returned
+    :class:`CompressResult` carries a ``diagnostics`` list of
+    :class:`~headroom.config.MessageDecision` objects — one per message —
+    describing which action was taken (compressed, protected, skipped …) and
+    how many tokens were spent before/after."""
+
     # Regime
     mode: str | None = None
     """Compression regime.
@@ -170,13 +178,6 @@ class CompressConfig:
     """Round-trip each compressed message and revert any that is not provably
     lossless (keeps the original for that message). Forced on when
     ``mode='agent'``. Sets :attr:`CompressResult.lossless`."""
-    diagnostics: bool = False
-    """Collect per-message compression decisions.  Also enabled by the
-    ``HEADROOM_DIAGNOSTICS=1`` environment variable.  When True, the returned
-    :class:`CompressResult` carries a ``diagnostics`` list of
-    :class:`~headroom.config.MessageDecision` objects — one per message —
-    describing which action was taken (compressed, protected, skipped …) and
-    how many tokens were spent before/after."""
 
 
 @dataclass
@@ -198,6 +199,7 @@ class CompressResult:
     tokens_saved: int = 0
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
+    diagnostics: list[MessageDecision] | None = None
     lossless: bool | None = None
     """Whether the output is provably lossless. ``True``/``False`` when
     verification ran (``mode='agent'`` or ``verify_lossless=True``); ``None``
@@ -206,7 +208,6 @@ class CompressResult:
     reverted_messages: int = 0
     """Messages reverted to their original form because their compression could
     not be verified lossless. Only meaningful when verification ran."""
-    diagnostics: list[MessageDecision] | None = None
 
 
 def compress(
@@ -401,8 +402,11 @@ def compress(
             compressed_messages, reverted, lossless = _verify_and_revert(
                 original_messages, compressed_messages
             )
-            if reverted:
-                tokens_after = _recount_tokens(pipeline, model, compressed_messages)
+
+        # Factoring and reverts change the messages after the pipeline counted
+        # them; recount with the pipeline's own message-counting contract.
+        if agent_mode or cfg.verify_lossless:
+            tokens_after = pipeline._get_tokenizer(model).count_messages(compressed_messages)
 
         tokens_saved = tokens_before - tokens_after
         ratio = tokens_saved / tokens_before if tokens_before > 0 else 0.0
@@ -572,19 +576,6 @@ def _get_agent_pipeline() -> Any:
         _agent_pipeline = TransformPipeline(transforms=[router])
         logger.debug("Headroom agent (densify-only) pipeline initialized")
         return _agent_pipeline
-
-
-def _recount_tokens(pipeline: Any, model: str, messages: list[dict[str, Any]]) -> int:
-    """Recount tokens over ``messages`` using the pipeline's tokenizer.
-
-    Mirrors how the pipeline counts (``count_text(str(content))`` per message)
-    so a post-verification revert produces a consistent ``tokens_after``.
-    """
-    try:
-        tokenizer = pipeline._get_tokenizer(model)
-        return sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
-    except Exception:  # pragma: no cover - tokenizer failure is non-fatal
-        return sum(len(str(m.get("content", ""))) // 4 for m in messages)
 
 
 def _apply_value_factoring(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
