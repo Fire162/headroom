@@ -16,6 +16,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -136,13 +138,94 @@ class TestConnectPrivateSqlite:
         assert _mode(tmp_path / created) == 0o600
 
     def test_file_prefixed_literal_path_is_private(self, tmp_path, monkeypatch):
-        # Without uri=True sqlite treats "file:..." as an ordinary file name.
+        # Without uri=True sqlite treats "file:..." as an ordinary file name,
+        # unless it was built with SQLITE_USE_URI (Debian, python Docker images).
         monkeypatch.chdir(tmp_path)
         conn = fileperms.connect_private_sqlite("file:literal.db")
         conn.execute("CREATE TABLE t(x)")
         conn.commit()
         conn.close()
-        assert _mode(tmp_path / "file:literal.db") == 0o600
+        assert [p.name for p in tmp_path.iterdir()] == [
+            "literal.db" if fileperms._sqlite_always_uri() else "file:literal.db"
+        ]
+        assert _mode(tmp_path / os.listdir(tmp_path)[0]) == 0o600
+
+    def test_file_prefix_is_a_uri_on_builds_that_always_parse_uris(self, monkeypatch):
+        monkeypatch.setattr(fileperms, "_sqlite_always_uri", lambda: True)
+        assert fileperms._sqlite_file_path("file:literal.db", uri=False) == "literal.db"
+        assert fileperms._sqlite_file_path("file::memory:", uri=False) is None
+        assert fileperms._sqlite_file_path("plain.db", uri=False) == "plain.db"
+
+    def test_undecodable_uri_escape_secures_the_raw_byte_name(self, tmp_path, monkeypatch):
+        # sqlite opens the raw 0xFF byte; securing U+FFFD instead would leave
+        # the real database at the umask.
+        monkeypatch.chdir(tmp_path)
+        try:
+            conn = fileperms.connect_private_sqlite("file:secret%FF.db", uri=True)
+        except OSError as exc:  # e.g. APFS refuses non-UTF-8 names
+            pytest.skip(f"filesystem rejects non-UTF-8 names: {exc}")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+        conn.close()
+        assert os.listdir(os.fsencode(tmp_path)) == [b"secret\xff.db"]
+        assert _mode(os.path.join(os.fsencode(tmp_path), b"secret\xff.db")) == 0o600
+
+    @pytest.mark.parametrize(
+        ("journal_mode", "sidecars"),
+        [("wal", ("-wal", "-shm")), ("persist", ("-journal",))],
+    )
+    def test_crash_leftover_sidecars_are_narrowed(self, tmp_path, journal_mode, sidecars):
+        # An older, unhardened run writes under the 022 umask and dies without
+        # a checkpoint, leaving 0644 sidecars that sqlite would reuse as-is.
+        db = tmp_path / "old.db"
+        script = (
+            "import os, sqlite3, sys\n"
+            "c = sqlite3.connect(sys.argv[1])\n"
+            f"c.execute('PRAGMA journal_mode={journal_mode}')\n"
+            "c.execute('CREATE TABLE t(x)')\n"
+            "c.execute(\"INSERT INTO t VALUES ('old')\")\n"
+            "c.commit()\n"
+            "os._exit(0)\n"
+        )
+        subprocess.run([sys.executable, "-c", script, str(db)], check=True)
+        for suffix in sidecars:
+            assert _mode(f"{db}{suffix}") == 0o644  # precondition
+
+        conn = fileperms.connect_private_sqlite(db)
+        for suffix in sidecars:
+            assert _mode(f"{db}{suffix}") == 0o600  # before sqlite writes a byte
+        conn.execute(f"PRAGMA journal_mode={journal_mode}")
+        conn.execute("INSERT INTO t VALUES ('PRIVATE-SENTINEL')")
+        conn.commit()
+
+        for suffix in sidecars:
+            assert _mode(f"{db}{suffix}") == 0o600
+        if journal_mode == "wal":
+            # The new row went into the reused WAL, which is now private.
+            assert b"PRIVATE-SENTINEL" in (tmp_path / "old.db-wal").read_bytes()
+        # Narrowing kept the leftover contents: the uncheckpointed row survives.
+        assert conn.execute("SELECT x FROM t ORDER BY rowid").fetchall() == [
+            ("old",),
+            ("PRIVATE-SENTINEL",),
+        ]
+        conn.close()
+
+    def test_missing_sidecars_are_not_precreated(self, tmp_path):
+        db = tmp_path / "m.db"
+        fileperms.connect_private_sqlite(db).close()
+        assert [p.name for p in tmp_path.iterdir()] == ["m.db"]
+
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+    def test_refuses_symlinked_sidecar(self, tmp_path, suffix):
+        db = tmp_path / "m.db"
+        sqlite3.connect(db).close()
+        victim = tmp_path / "victim"
+        victim.write_text("SECRET")
+        (tmp_path / f"m.db{suffix}").symlink_to(victim)
+        with pytest.raises(PermissionError):
+            fileperms.connect_private_sqlite(db)
+        assert _mode(victim) == 0o644
+        assert victim.read_text() == "SECRET"
 
     def test_read_only_uri_does_not_create_missing_db(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

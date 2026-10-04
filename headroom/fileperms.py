@@ -47,6 +47,7 @@ a kernel-enforced one.
 
 from __future__ import annotations
 
+import functools
 import os
 import sqlite3
 import stat
@@ -193,11 +194,27 @@ def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> 
         os.close(fd)
 
 
+@functools.cache
+def _sqlite_always_uri() -> bool:
+    """Whether this sqlite reads ``file:`` names as URIs even without ``uri=True``.
+
+    True for builds compiled with ``SQLITE_USE_URI`` — Debian's, and so the
+    official ``python`` Docker images.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        options = {row[0] for row in conn.execute("PRAGMA compile_options")}
+    finally:
+        conn.close()
+    return bool(options & {"USE_URI", "USE_URI=1"})
+
+
 def _sqlite_file_path(path: str | os.PathLike[str], *, uri: bool) -> str | None:
     """The file sqlite will create or open for *path*; ``None`` if there is none.
 
     Mirrors sqlite's own rules. Without ``uri=True`` the name is a literal
-    path, even one that starts with ``file:``. With it, a ``file:`` URI names
+    path, even one that starts with ``file:``, unless this sqlite was built to
+    always parse URIs (:func:`_sqlite_always_uri`). Parsed as a URI, ``file:`` names
     its percent-decoded path (relative to the working directory unless
     absolute), and is in-memory when that path is empty or ``:memory:`` or the
     query says ``mode=memory``. ``mode=ro`` / ``mode=rw`` never create the
@@ -206,14 +223,16 @@ def _sqlite_file_path(path: str | os.PathLike[str], *, uri: bool) -> str | None:
     text = os.fspath(path)
     if text in ("", ":memory:"):
         return None
-    if not (uri and text.startswith("file:")):
+    if not (text.startswith("file:") and (uri or _sqlite_always_uri())):
         return text
     if not OWNER_ONLY_SUPPORTED:
         # No mode bits to set (module docstring), and Windows URIs carry a
         # drive letter sqlite strips its own way: pass them through.
         return None
     parts = urlsplit(text)
-    file_path = unquote(parts.path)
+    # surrogateescape keeps an undecodable %XX byte as that raw byte, which is
+    # the name sqlite opens; the default "replace" would secure a different one.
+    file_path = unquote(parts.path, errors="surrogateescape")
     mode = parse_qs(parts.query).get("mode", [""])[-1]
     if file_path in ("", ":memory:") or mode == "memory":
         return None
@@ -222,6 +241,10 @@ def _sqlite_file_path(path: str | os.PathLike[str], *, uri: bool) -> str | None:
     if mode in ("ro", "rw") and not os.path.lexists(file_path):
         return None
     return file_path
+
+
+#: Files sqlite keeps next to a database and reopens by name.
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 def connect_private_sqlite(
@@ -235,13 +258,23 @@ def connect_private_sqlite(
     Drop-in for ``sqlite3.connect(str(path), **kwargs)`` at every store that
     holds conversation-derived content. In-memory databases are passed
     straight through; a file-backed ``file:`` URI (``uri=True``) has its
-    underlying file made private like a plain path. The parent directory must
+    underlying file made private like a plain path. Existing ``-wal`` /
+    ``-shm`` / ``-journal`` sidecars are narrowed too. The parent directory must
     already exist; create it with :func:`private_dir` if it is dedicated to
     this store.
     """
     file_path = _sqlite_file_path(path, uri=bool(connect_kwargs.get("uri")))
     if file_path is not None:
         ensure_private_file(file_path, what=what)
+        # A crash can leave -wal/-shm/-journal sidecars behind with the mode
+        # of an older, unhardened run, and sqlite reuses them as they are.
+        # Narrow any that exist (refusing symlinks) before sqlite writes to
+        # them. Missing ones are left alone: sqlite creates them with the
+        # main file's mode, which is now 0600.
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            sidecar = file_path + suffix
+            if os.path.lexists(sidecar):
+                ensure_private_file(sidecar, what=f"{what} {suffix[1:]} file")
     # ``**connect_kwargs: Any`` makes mypy type the call as ``Any``; the
     # annotation pins it back to the real return type.
     conn: sqlite3.Connection = sqlite3.connect(os.fspath(path), **connect_kwargs)
