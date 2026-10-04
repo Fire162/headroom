@@ -45,6 +45,8 @@ def test_partition_differs_per_credential_and_is_stable_per_credential() -> None
     "header",
     [
         "authorization",
+        "proxy-authorization",
+        "cookie",
         "x-api-key",
         "api-key",
         "x-goog-api-key",
@@ -206,8 +208,33 @@ def _drive(path: str, body: dict, reply, header: str, fmt: str):  # noqa: ANN001
     [
         ("/v1/messages", ANTHROPIC_BODY, _anthropic_reply, "x-api-key", "key-{}"),
         ("/v1/chat/completions", OPENAI_BODY, _openai_reply, "authorization", "Bearer key-{}"),
+        # Cookie and Proxy-Authorization are forwarded upstream, so a
+        # cookie-authenticated gateway must not let two sessions share a reply.
+        ("/v1/messages", ANTHROPIC_BODY, _anthropic_reply, "cookie", "session=key-{}"),
+        ("/v1/chat/completions", OPENAI_BODY, _openai_reply, "cookie", "session=key-{}"),
+        (
+            "/v1/messages",
+            ANTHROPIC_BODY,
+            _anthropic_reply,
+            "proxy-authorization",
+            "Basic key-{}",
+        ),
+        (
+            "/v1/chat/completions",
+            OPENAI_BODY,
+            _openai_reply,
+            "proxy-authorization",
+            "Basic key-{}",
+        ),
     ],
-    ids=["anthropic", "openai"],
+    ids=[
+        "anthropic",
+        "openai",
+        "anthropic-cookie",
+        "openai-cookie",
+        "anthropic-proxy-authorization",
+        "openai-proxy-authorization",
+    ],
 )
 def test_second_caller_is_never_served_first_callers_cached_response(
     path, body, reply, header, fmt

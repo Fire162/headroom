@@ -11,6 +11,8 @@ import secrets
 from collections.abc import Mapping
 from typing import Any
 
+from headroom.proxy.internal_header_policy import INTERNAL_HEADER_PREFIX, is_credential_header
+
 logger = logging.getLogger(__name__)
 
 # Per-process key for the cache partition HMAC. The semantic response cache is
@@ -19,15 +21,16 @@ logger = logging.getLogger(__name__)
 # never be computed (or brute-forced from a guessed credential) outside it.
 _PARTITION_KEY = secrets.token_bytes(32)
 
-# A header carries caller credentials or selects the billed account when it is
-# ``authorization`` or its name ends in one of these tokens (``x-api-key``,
-# ``api-key``, ``x-goog-api-key``, ``chatgpt-account-id``,
-# ``openai-organization``, ``openai-project``, ...). Matching by shape rather
+# A header carries caller credentials or selects the billed account when the
+# shared credential-header rule matches it (``authorization``,
+# ``proxy-authorization``, ``cookie``, ``x-api-key``, ...) or its name ends in
+# one of these tokens (``x-goog-api-key``, ``chatgpt-account-id``,
+# ``openai-organization``, ``openai-project``, ...). Every such header the
+# handlers forward upstream must be in the partition. Matching by shape rather
 # than by a fixed provider list keeps new providers partitioned by default.
 _CREDENTIAL_HEADER_RE = re.compile(
     r"(^|[-_])(api[-_]?key|key|token|secret|account|account[-_]id|organization|project)$"
 )
-_INTERNAL_HEADER_PREFIX = "x-headroom-"
 # Per-request nonces that match the credential shape but identify nothing: a
 # fresh value per call would make every request a unique partition.
 _NON_CREDENTIAL_HEADERS = frozenset({"idempotency-key", "x-idempotency-key"})
@@ -35,10 +38,13 @@ ANONYMOUS_PARTITION = "anon"
 
 
 def _is_credential_header(name: str) -> bool:
+    # ``x-headroom-*`` headers (including the proxy's own token, which the
+    # security gate has already removed) never reach the upstream, so they
+    # never identify the upstream account.
     lowered = name.lower()
-    if lowered.startswith(_INTERNAL_HEADER_PREFIX) or lowered in _NON_CREDENTIAL_HEADERS:
+    if lowered.startswith(INTERNAL_HEADER_PREFIX) or lowered in _NON_CREDENTIAL_HEADERS:
         return False
-    return lowered == "authorization" or bool(_CREDENTIAL_HEADER_RE.search(lowered))
+    return is_credential_header(lowered) or bool(_CREDENTIAL_HEADER_RE.search(lowered))
 
 
 def compute_cache_partition(
