@@ -1534,9 +1534,11 @@ class KompressCompressor(Transform):
     # ``_time_budget_cap_seconds``, which lowers this call's time budget to
     # what the caller's request-scoped ML budget has left. Duck-typed rather than
     # isinstance-checked at the call site because ``RemoteKompressCompressor``
-    # is the other compressor the router may get back and its ``compress()``
-    # does not take the argument.
+    # is the other compressor the router may get back: its ``compress()`` takes
+    # the cap (flagged by ``accepts_time_budget_cap``) but not the deadline
+    # origin.
     shares_request_deadline: bool = True
+    accepts_time_budget_cap: bool = True
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()

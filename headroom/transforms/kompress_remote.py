@@ -53,7 +53,11 @@ never correctness.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
+import time
+from typing import Any
 
 import httpx
 
@@ -101,6 +105,18 @@ _MIN_WORDS = 10
 # Accept-any-shrink CCR gate, identical to KompressCompressor.compress: only
 # store + mark when the shrink is worth the retrieval marker's own cost.
 
+# A remote call is declined outright when the caller's request-scoped ML budget
+# has this little left: no HTTP round trip (connect + write + server inference +
+# read) fits in it, so starting one only burns the budget and leaves a worker
+# behind. The block passes through unchanged instead.
+_MIN_REMOTE_BUDGET_SECONDS = 0.05
+
+# Workers for budget-capped calls. A call that overruns its cap is abandoned,
+# not killed (a sync httpx request cannot be interrupted from another thread);
+# its per-phase timeouts are lowered to the cap too, so an abandoned worker is
+# freed soon after.
+_CAPPED_CALL_WORKERS = 16
+
 
 class RemoteKompressCompressor:
     """Drop-in for KompressCompressor that POSTs to a hosted ``/compress`` endpoint.
@@ -111,6 +127,12 @@ class RemoteKompressCompressor:
 
     name = "kompress_compressor"
 
+    # ``compress()`` accepts ``_time_budget_cap_seconds``: what the router's
+    # request-scoped ML budget has left. Unlike local Kompress this class does
+    # not take ``_deadline_started_at``, so it does not set
+    # ``shares_request_deadline``; the router checks this flag separately.
+    accepts_time_budget_cap: bool = True
+
     def __init__(
         self,
         endpoint: str,
@@ -119,6 +141,7 @@ class RemoteKompressCompressor:
         timeout: float = 20.0,
         path: str | None = DEFAULT_ENDPOINT_PATH,
         headers: dict[str, str] | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.config = config or KompressConfig()
         # Default keeps the pre-existing behaviour exactly: <endpoint>/compress.
@@ -140,7 +163,12 @@ class RemoteKompressCompressor:
         if headers:
             self._headers.update(headers)
         # httpx.Client is safe to share across the proxy's worker threads.
-        self._client = httpx.Client(timeout=timeout)
+        # ``transport`` exists for tests (httpx.MockTransport); None is the
+        # normal network transport.
+        self._timeout = timeout
+        self._client = httpx.Client(timeout=timeout, transport=transport)
+        self._capped_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self._capped_pool_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -185,8 +213,17 @@ class RemoteKompressCompressor:
         *,
         allow_download: bool = True,
         ccr_original: str | None = None,
+        _time_budget_cap_seconds: float | None = None,
     ) -> KompressResult:
         """Compress via the remote endpoint.
+
+        ``_time_budget_cap_seconds`` is what is left of the caller's
+        request-scoped ML budget (ContentRouter passes it). It bounds the HTTP
+        request AS A WHOLE -- connect, write, server time and read together,
+        not each phase -- and a call that runs out passes the block through
+        unchanged. When the remainder is at or below
+        :data:`_MIN_REMOTE_BUDGET_SECONDS` no request is made at all. ``None``
+        (direct callers) keeps the configured per-phase timeout, 20s by default.
 
         ``ccr_original`` mirrors :meth:`KompressCompressor.compress`: text to
         store in CCR instead of ``content``, used when ``content`` is a
@@ -212,14 +249,23 @@ class RemoteKompressCompressor:
         if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
 
-        try:
-            resp = self._client.post(
-                self._url,
-                headers=self._headers,
-                json={"content": content, "target_ratio": target_ratio},
+        payload = {"content": content, "target_ratio": target_ratio}
+        if _time_budget_cap_seconds is not None and (
+            _time_budget_cap_seconds <= _MIN_REMOTE_BUDGET_SECONDS
+        ):
+            logger.info(
+                "Remote Kompress declined: %.3fs of request ML budget left (floor %.3fs); "
+                "passing through unchanged",
+                max(0.0, _time_budget_cap_seconds),
+                _MIN_REMOTE_BUDGET_SECONDS,
             )
-            resp.raise_for_status()
-            data = resp.json()
+            return self._passthrough(content, n_words)
+
+        try:
+            if _time_budget_cap_seconds is None:
+                data = self._post(payload)
+            else:
+                data = self._post_within(payload, _time_budget_cap_seconds)
             compressed = data["compressed"]
             if not isinstance(compressed, str):
                 raise TypeError("remote Kompress response field 'compressed' must be a string")
@@ -281,5 +327,45 @@ class RemoteKompressCompressor:
 
         return result
 
+    def _post(self, payload: dict[str, Any], timeout: float | None = None) -> Any:
+        # No ``timeout`` kwarg on the default path: the client's own (20s)
+        # applies, and the call is exactly what it was before the cap existed.
+        extra: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        resp = self._client.post(self._url, headers=self._headers, json=payload, **extra)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post_within(self, payload: dict[str, Any], cap: float) -> Any:
+        """POST and read the response within *cap* seconds in total.
+
+        httpx timeouts are per phase (connect, write, each read, pool), so a
+        request under ``timeout=cap`` can still take several times *cap*. The
+        request therefore runs on a worker and is waited on with one overall
+        deadline; the per-phase timeouts are lowered to *cap* as well so an
+        abandoned worker does not linger for the 20s default.
+        """
+        started = time.monotonic()
+        future = self._get_capped_pool().submit(self._post, payload, min(cap, self._timeout))
+        try:
+            return future.result(timeout=max(0.0, cap - (time.monotonic() - started)))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"exceeded the request ML budget ({cap:.3f}s) before the endpoint answered"
+            ) from None
+
+    def _get_capped_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        with self._capped_pool_lock:
+            if self._capped_pool is None:
+                self._capped_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_CAPPED_CALL_WORKERS,
+                    thread_name_prefix="remote-kompress",
+                )
+            return self._capped_pool
+
     def close(self) -> None:
+        with self._capped_pool_lock:
+            pool, self._capped_pool = self._capped_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         self._client.close()

@@ -4717,9 +4717,14 @@ class ContentRouter(Transform):
                             compress_kwargs["_deadline_started_at"] = deadline_origin
                         # The ML budget's remainder caps THIS call, so the
                         # first one of a request -- admitted without a measured
-                        # cost -- cannot run past the budget either.
-                        if _remaining is not None and getattr(
-                            compressor, "shares_request_deadline", False
+                        # cost -- cannot run past the budget either. Remote
+                        # Kompress takes the cap too (it bounds the whole HTTP
+                        # request, and declines the call when too little is
+                        # left) but not the shared deadline origin, hence the
+                        # separate flag.
+                        if _remaining is not None and (
+                            getattr(compressor, "shares_request_deadline", False)
+                            or getattr(compressor, "accepts_time_budget_cap", False)
                         ):
                             compress_kwargs["_time_budget_cap_seconds"] = _remaining
                         _ml_started = time.monotonic()

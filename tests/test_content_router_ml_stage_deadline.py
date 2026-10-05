@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 import time
 from dataclasses import dataclass
 
+import httpx
 import pytest
 
 from headroom.transforms import content_router as cr
+from headroom.transforms.kompress_remote import RemoteKompressCompressor
 
 
 class _Tokenizer:
@@ -423,3 +426,123 @@ def test_blocks_refused_by_the_budget_pass_through_unchanged(monkeypatch) -> Non
 
     assert out == text
     assert stub.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# Third review: the cap reached only LOCAL Kompress. RemoteKompressCompressor
+# got no cap and kept its independent 20s per-phase HTTP timeouts, so a cold
+# remote call -- no measured rate, so nothing to refuse it on -- could run past
+# both the ML budget and the outer timeout. These drive the real remote class
+# through the public apply() with an httpx.MockTransport (no network).
+# --------------------------------------------------------------------------- #
+
+
+def _tool_result_text(messages: list[dict]) -> str:
+    return messages[-1]["content"][0]["content"]
+
+
+def _assert_prose_blocks_unchanged(messages: list[dict]) -> None:
+    """Every ML-eligible prose block reaches the provider byte-identical.
+
+    (The small JSON separators go through the lossless JSON path, which
+    minifies them; that is not ML and not what is under test.)
+    """
+    out = _tool_result_text(messages)
+    for i in range(8):
+        assert _prose(40_000, seed=i) in out, f"prose block {i} was altered"
+
+
+def _remote_kompress(handler) -> RemoteKompressCompressor:
+    return RemoteKompressCompressor(
+        endpoint="http://kompress.invalid",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def _compressed_reply(request: httpx.Request) -> httpx.Response:
+    content = json.loads(request.content)["content"]
+    return httpx.Response(200, json={"compressed": " ".join(content.split()[::2])})
+
+
+def test_cold_remote_call_cannot_overrun_a_tiny_ml_budget(charged, monkeypatch) -> None:
+    """The reviewer's probe: 10 ms ML budget, 40 ms outer timeout, an endpoint
+    that takes 100 ms. No HTTP round trip fits in what is left, so the remote
+    call is declined and every block passes through unchanged."""
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "0.01")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "0.04")
+    assert cr._ml_stage_deadline_seconds() == 0.01
+
+    requests: list[httpx.Request] = []
+
+    def _slow_endpoint(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        time.sleep(0.1)
+        return _compressed_reply(request)
+
+    remote = _remote_kompress(_slow_endpoint)
+    monkeypatch.setattr(cr.ContentRouter, "_get_kompress", lambda self: remote)
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+
+    messages = _tool_result_messages()
+    result = router.apply(messages, _Tokenizer(), frozen_message_count=1, min_tokens_to_compress=1)
+
+    assert charged, "the remote compressor must still be reached and billed"
+    assert sum(charged) < 0.04, f"remote ML ran {sum(charged):.3f}s under a 40 ms outer timeout"
+    assert requests == [], "a call that cannot fit the budget must not be sent"
+    _assert_prose_blocks_unchanged(result.messages)
+
+
+def test_cold_remote_call_is_bounded_as_a_whole_by_the_ml_budget(charged, monkeypatch) -> None:
+    """With enough budget to try, the first (unmeasured) remote call is capped
+    by the remainder -- over the whole request, not per httpx phase -- and an
+    endpoint slower than that leaves the block unchanged."""
+    budget = 0.2
+    monkeypatch.setenv("HEADROOM_ML_STAGE_DEADLINE_SECONDS", str(budget))
+    monkeypatch.setenv("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30")
+
+    release = threading.Event()
+    timeouts: list[dict] = []
+
+    def _hung_endpoint(request: httpx.Request) -> httpx.Response:
+        timeouts.append(dict(request.extensions["timeout"]))
+        release.wait(5.0)  # far past the budget; MockTransport ignores httpx timeouts
+        return _compressed_reply(request)
+
+    remote = _remote_kompress(_hung_endpoint)
+    monkeypatch.setattr(cr.ContentRouter, "_get_kompress", lambda self: remote)
+    router = cr.ContentRouter(cr.ContentRouterConfig(enable_kompress=True))
+
+    messages = _tool_result_messages()
+    try:
+        result = router.apply(
+            messages, _Tokenizer(), frozen_message_count=1, min_tokens_to_compress=1
+        )
+    finally:
+        release.set()
+        remote.close()
+
+    assert timeouts, "the first block must reach the endpoint"
+    assert all(0.0 < t <= budget for t in timeouts[0].values()), (
+        f"per-phase timeouts were not lowered to the budget: {timeouts[0]}"
+    )
+    assert sum(charged) <= budget + 0.1, (
+        f"remote ML ran {sum(charged):.3f}s against a {budget}s budget"
+    )
+    _assert_prose_blocks_unchanged(result.messages)
+
+
+def test_remote_kompress_keeps_its_default_timeout_without_a_budget() -> None:
+    """Direct callers pass no cap: same single request, 20s per-phase timeouts."""
+    timeouts: list[dict] = []
+
+    def _endpoint(request: httpx.Request) -> httpx.Response:
+        timeouts.append(dict(request.extensions["timeout"]))
+        return _compressed_reply(request)
+
+    remote = _remote_kompress(_endpoint)
+    text = _prose(2_000)
+    out = remote.compress(text)
+
+    assert out.compressed != text
+    assert timeouts == [{"connect": 20.0, "read": 20.0, "write": 20.0, "pool": 20.0}]
+    assert remote._capped_pool is None, "the default path must not hop threads"
