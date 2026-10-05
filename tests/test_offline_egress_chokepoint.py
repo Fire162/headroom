@@ -828,7 +828,7 @@ class TestModelLoadersDegradeExplicitly:
 
         class _AutoTokenizer:
             @staticmethod
-            def from_pretrained(name: str, *, local_files_only: bool) -> object:
+            def from_pretrained(name: str, *, local_files_only: bool, **_kwargs: object) -> object:
                 calls.append(local_files_only)
                 if local_files_only:
                     raise OSError("not cached")
@@ -892,6 +892,385 @@ class TestModelLoadersDegradeExplicitly:
         assert _hf_artifact("acme/model", "model.onnx", allow_network=True) == (
             "/cache/acme/model.onnx"
         )
+
+
+# ───────── Transformers / sentence-transformers / datasets loaders ─────────
+#
+# Jerrett's review of the chokepoint PR: with HEADROOM_OFFLINE=1 and an
+# explicit HF_HUB_OFFLINE=0, ``apply_offline_env`` keeps the operator's value
+# (it uses setdefault), huggingface_hub's offline constant stays false even
+# with TRANSFORMERS_OFFLINE=1, and the public ``MLModelRegistry.get_siglip()``
+# reached two ``from_pretrained`` calls with no ``local_files_only`` and no
+# guard. The technique-router loaders and the Kompress PyTorch encoder had the
+# same shape. Every test below runs under exactly that configuration, with
+# fake loaders and the socket AND DNS entry points booby-trapped, and asserts
+# that the only load attempted is the cache-only one.
+
+
+@pytest.fixture
+def offline_with_hf_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_OFFLINE=1 with the operator explicitly re-enabling the Hub."""
+    from headroom.offline import apply_offline_env
+
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    apply_offline_env()
+    # The premise of the review: the explicit override survives, so the
+    # HuggingFace env flags are NOT what keeps these loaders off the network.
+    assert os.environ["HF_HUB_OFFLINE"] == "0"
+
+
+@pytest.fixture
+def no_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail closed on name resolution too: a loader that resolves
+    huggingface.co has already decided to dial out, even if the connect is
+    later refused by something else."""
+
+    def _getaddrinfo(host: object, *args: object, **kwargs: object) -> object:
+        raise SocketOpened(f"DNS lookup of {host!r} attempted")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+
+
+class _FakeHfLoader:
+    """A ``from_pretrained``-shaped callable recording every attempt.
+
+    ``cached`` decides the cache-only answer. A non-cache-only attempt is the
+    download, so it raises :class:`SocketOpened` — the test fails at the exact
+    point a real loader would have reached the Hub.
+    """
+
+    def __init__(self, *, cached: bool) -> None:
+        self.cached = cached
+        self.calls: list[tuple[str, bool]] = []
+
+    def __call__(self, name: str, *, local_files_only: bool = False, **_kwargs: object) -> object:
+        self.calls.append((name, local_files_only))
+        if local_files_only:
+            if self.cached:
+                return SimpleNamespace(name=name, eval=lambda: None, to=lambda device: None)
+            raise OSError(f"{name} is not in the local cache")
+        raise SocketOpened(f"would download {name} from the Hub")
+
+    @property
+    def from_pretrained(self) -> _FakeHfLoader:
+        return self
+
+
+@pytest.fixture
+def fake_transformers(monkeypatch: pytest.MonkeyPatch) -> dict[str, _FakeHfLoader]:
+    """Replace ``transformers`` with cold-cache fake Auto* classes."""
+    import sys
+
+    loaders = {
+        name: _FakeHfLoader(cached=False)
+        for name in (
+            "AutoModel",
+            "AutoProcessor",
+            "AutoTokenizer",
+            "AutoModelForSequenceClassification",
+        )
+    }
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(**loaders))
+    return loaders
+
+
+class TestHfLoaderHelper:
+    """``onnx_runtime.hf_from_pretrained_local_first`` is the one place the
+    order lives: cache-only first, guard_egress on a miss, remote last."""
+
+    def test_a_cold_cache_is_refused_before_any_remote_attempt(
+        self, offline_with_hf_override: None, no_sockets: None, no_dns: None
+    ) -> None:
+        from headroom.onnx_runtime import hf_from_pretrained_local_first
+
+        loader = _FakeHfLoader(cached=False)
+        with pytest.raises(OfflineEgressBlocked) as excinfo:
+            hf_from_pretrained_local_first(loader, "acme/model", purpose="test model")
+        assert loader.calls == [("acme/model", True)]
+        assert _refused_hostname(excinfo.value) == "huggingface.co"
+
+    def test_a_warm_cache_loads_offline_without_the_network(
+        self, offline_with_hf_override: None, no_sockets: None, no_dns: None
+    ) -> None:
+        from headroom.onnx_runtime import hf_from_pretrained_local_first
+
+        loader = _FakeHfLoader(cached=True)
+        model = hf_from_pretrained_local_first(loader, "acme/model", purpose="test model")
+        assert model.name == "acme/model"
+        assert loader.calls == [("acme/model", True)]
+
+    def test_online_a_cold_cache_still_downloads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from headroom.onnx_runtime import hf_from_pretrained_local_first
+
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+        loader = _FakeHfLoader(cached=False)
+        with pytest.raises(SocketOpened):
+            hf_from_pretrained_local_first(loader, "acme/model", purpose="test model")
+        assert loader.calls == [("acme/model", True), ("acme/model", False)]
+
+    def test_cache_only_mode_re_raises_the_miss(
+        self, offline_with_hf_override: None, no_sockets: None, no_dns: None
+    ) -> None:
+        from headroom.onnx_runtime import hf_from_pretrained_local_first
+
+        loader = _FakeHfLoader(cached=False)
+        with pytest.raises(OSError, match="not in the local cache"):
+            hf_from_pretrained_local_first(
+                loader, "acme/model", purpose="test model", allow_network=False
+            )
+        assert loader.calls == [("acme/model", True)]
+
+    def test_a_broken_local_directory_is_not_turned_into_a_download(
+        self, offline_with_hf_override: None, no_sockets: None, no_dns: None, tmp_path: Path
+    ) -> None:
+        from headroom.onnx_runtime import hf_from_pretrained_local_first
+
+        loader = _FakeHfLoader(cached=False)
+        with pytest.raises(OSError, match="not in the local cache"):
+            hf_from_pretrained_local_first(loader, str(tmp_path), purpose="test model")
+        assert loader.calls == [(str(tmp_path), True)]
+
+
+class TestRegistryLoadersWithExplicitHfOverride:
+    """``MLModelRegistry`` is public API; its loaders are what the review
+    reproduced against."""
+
+    def test_get_siglip_refuses_legibly(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from headroom.models.ml_models import MLModelRegistry, ModelUnavailableOffline
+
+        name = "acme/siglip-cold"
+        with caplog.at_level("WARNING"), pytest.raises(ModelUnavailableOffline) as excinfo:
+            MLModelRegistry.get_siglip(model_name=name, device="cpu")
+        assert isinstance(excinfo.value, RuntimeError), "callers degrade on RuntimeError"
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert "HEADROOM_OFFLINE" in str(excinfo.value)
+        assert "HEADROOM_OFFLINE" in caplog.text
+        assert fake_transformers["AutoModel"].calls == [(name, True)]
+        assert fake_transformers["AutoProcessor"].calls == []
+        assert f"siglip:{name}" not in MLModelRegistry.loaded_models()
+
+    def test_get_siglip_loads_from_a_warm_cache(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+    ) -> None:
+        from headroom.models.ml_models import MLModelRegistry
+
+        name = "acme/siglip-warm"
+        fake_transformers["AutoModel"].cached = True
+        fake_transformers["AutoProcessor"].cached = True
+        try:
+            model, processor = MLModelRegistry.get_siglip(model_name=name, device="cpu")
+            assert (model.name, processor.name) == (name, name)
+            assert fake_transformers["AutoModel"].calls == [(name, True)]
+            assert fake_transformers["AutoProcessor"].calls == [(name, True)]
+        finally:
+            MLModelRegistry.unload_many([f"siglip:{name}"])
+
+    def test_get_technique_router_refuses_legibly(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+    ) -> None:
+        from headroom.models.ml_models import MLModelRegistry, ModelUnavailableOffline
+
+        name = "acme/technique-router-cold"
+        with pytest.raises(ModelUnavailableOffline) as excinfo:
+            MLModelRegistry.get_technique_router(model_path=name, device="cpu")
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert fake_transformers["AutoTokenizer"].calls == [(name, True)]
+        assert fake_transformers["AutoModelForSequenceClassification"].calls == []
+
+    def test_get_technique_router_model_half_is_guarded_too(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+    ) -> None:
+        """Tokenizer cached, classifier weights not: the second loader must be
+        refused on its own, not ride on the first one having succeeded."""
+        from headroom.models.ml_models import MLModelRegistry, ModelUnavailableOffline
+
+        name = "acme/technique-router-half"
+        fake_transformers["AutoTokenizer"].cached = True
+        with pytest.raises(ModelUnavailableOffline):
+            MLModelRegistry.get_technique_router(model_path=name, device="cpu")
+        assert fake_transformers["AutoModelForSequenceClassification"].calls == [(name, True)]
+
+    def test_get_sentence_transformer_refuses_legibly(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import sys
+
+        from headroom.models.ml_models import MLModelRegistry, ModelUnavailableOffline
+
+        loader = _FakeHfLoader(cached=False)
+        monkeypatch.setitem(
+            sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=loader)
+        )
+        name = "acme/minilm-cold"
+        with pytest.raises(ModelUnavailableOffline):
+            MLModelRegistry.get_sentence_transformer(name, device="cpu")
+        assert loader.calls == [(name, True)]
+
+    def test_the_pytorch_image_router_is_refused_not_fetched(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+    ) -> None:
+        """The degradation end to end through ``TrainedRouter``: the SigLIP
+        load is refused as ``ModelUnavailableOffline`` — a RuntimeError, which
+        ``ImageCompressor``'s existing ``except Exception`` turns into
+        "preserve the image" — and nothing is downloaded."""
+        pytest.importorskip("torch")
+        from headroom.image.trained_router import TrainedRouter
+        from headroom.models.ml_models import ModelUnavailableOffline
+
+        fake_transformers["AutoTokenizer"].cached = True
+        fake_transformers["AutoModelForSequenceClassification"].cached = True
+        router = TrainedRouter(model_path="acme/router-warm", use_siglip=True, device="cpu")
+        try:
+            with pytest.raises(ModelUnavailableOffline):
+                router._load_models()
+            assert fake_transformers["AutoModel"].calls, "SigLIP was never attempted"
+            assert all(local for _, local in fake_transformers["AutoModel"].calls)
+        finally:
+            router.release_models()
+
+
+class TestKompressEncoderWithExplicitHfOverride:
+    def test_the_pytorch_encoder_is_refused_not_fetched(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_transformers: dict[str, _FakeHfLoader],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``allow_download=True`` used to become ``local_files_only=False``
+        straight away: no cache attempt, no guard."""
+        pytest.importorskip("torch")
+        from headroom.transforms import kompress_compressor
+
+        model_cls = kompress_compressor._get_model_class()
+        with (
+            caplog.at_level("WARNING"),
+            pytest.raises(kompress_compressor.KompressModelNotCached) as excinfo,
+        ):
+            model_cls(allow_download=True)
+        assert isinstance(excinfo.value.__cause__, OfflineEgressBlocked)
+        assert fake_transformers["AutoModel"].calls == [("answerdotai/ModernBERT-base", True)]
+        assert "HEADROOM_OFFLINE forbids fetching it" in caplog.text
+
+    def test_the_pytorch_backend_load_degrades_to_not_cached(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_transformers: dict[str, _FakeHfLoader],
+    ) -> None:
+        """Through the real backend entry point: KompressModelNotCached is the
+        error every caller already maps to the non-ML path."""
+        pytest.importorskip("torch")
+        from headroom.transforms import kompress_compressor
+
+        monkeypatch.setattr(kompress_compressor, "_kompress_cache", {})
+        with pytest.raises(kompress_compressor.KompressModelNotCached):
+            kompress_compressor._load_kompress_pytorch(
+                "acme/kompress-cold", "cpu", allow_download=True
+            )
+        assert fake_transformers["AutoModel"].calls
+        assert all(local for _, local in fake_transformers["AutoModel"].calls)
+
+    def test_the_tokenizer_under_the_override(
+        self, offline_with_hf_override: None, no_sockets: None, no_dns: None
+    ) -> None:
+        from headroom.transforms import kompress_compressor
+
+        loader = _FakeHfLoader(cached=False)
+        with pytest.raises(kompress_compressor.KompressModelNotCached):
+            kompress_compressor._load_modernbert_tokenizer(loader, allow_download=True)
+        assert loader.calls == [("answerdotai/ModernBERT-base", True)]
+
+
+class TestEvalDatasetsWithExplicitHfOverride:
+    @pytest.fixture
+    def fake_datasets(self, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+        import sys
+
+        from huggingface_hub import constants as hf_constants
+
+        config = SimpleNamespace(HF_HUB_OFFLINE=False)
+        state = SimpleNamespace(cached=False, calls=[], config=config)
+
+        def load_dataset(path: str, *args: object, **kwargs: object) -> object:
+            forced = (config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE)
+            state.calls.append((path, forced))
+            if forced == (True, True):
+                if state.cached:
+                    return [{"path": path}]
+                raise FileNotFoundError(f"{path} is not in the local cache")
+            raise SocketOpened(f"would download dataset {path}")
+
+        monkeypatch.setitem(
+            sys.modules, "datasets", SimpleNamespace(load_dataset=load_dataset, config=config)
+        )
+        monkeypatch.setitem(sys.modules, "datasets.config", config)
+        return state
+
+    def test_a_cold_dataset_is_refused(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_datasets: SimpleNamespace,
+    ) -> None:
+        from huggingface_hub import constants as hf_constants
+
+        from headroom.evals.datasets import load_hf_dataset
+
+        before = hf_constants.HF_HUB_OFFLINE
+        with pytest.raises(OfflineEgressBlocked):
+            load_hf_dataset("acme/qa", split="test")
+        assert fake_datasets.calls == [("acme/qa", (True, True))]
+        assert (fake_datasets.config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE) == (
+            False,
+            before,
+        ), "the forced-offline constants must be restored"
+
+    def test_a_cached_dataset_still_loads(
+        self,
+        offline_with_hf_override: None,
+        no_sockets: None,
+        no_dns: None,
+        fake_datasets: SimpleNamespace,
+    ) -> None:
+        from headroom.evals.datasets import load_hf_dataset
+
+        fake_datasets.cached = True
+        assert load_hf_dataset("acme/qa") == [{"path": "acme/qa"}]
+        assert fake_datasets.calls == [("acme/qa", (True, True))]
 
 
 class TestBroadHandlerSweep:
@@ -1634,6 +2013,10 @@ _EGRESS_CALLEES = re.compile(
       | aiohttp\.ClientSession
       | urllib3\.PoolManager
       | (?:huggingface_hub\.)?hf_hub_download          # the Python half of the HF fetch
+      | (?:huggingface_hub\.)?snapshot_download        # whole-repo HF fetch
+      | (?:[\w.]+\.)?from_pretrained                   # transformers/tokenizers loaders
+      | (?:sentence_transformers\.)?(?:SentenceTransformer|CrossEncoder|SparseEncoder)
+      | (?:datasets\.)?load_dataset                     # HF datasets (eval harness)
       | (?:fastembed\.)?TextEmbedding                  # fastembed pulls ONNX weights from HF
       | OTLP(?:Metric|Span|Log)Exporter                # OTEL export, incl. its background timer
       | (?:openai\.)?(?:Async)?(?:OpenAI|AzureOpenAI)  # provider SDKs build their own
@@ -1777,26 +2160,32 @@ def _is_egress_call(call: ast.Call, aliases: dict[str, str]) -> str | None:
     # their leaf (the OTLP exporters live at a module path far too long and too
     # version-dependent to pin), and those are imported, so canonicalising
     # lengthens rather than normalises them.
-    if _EGRESS_CALLEES.match(canonical):
-        name = canonical
-    elif _EGRESS_CALLEES.match(raw):
-        name = raw
-    else:
+    local_files_only = next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "local_files_only"),
+        None,
+    )
+    if isinstance(local_files_only, ast.Constant) and local_files_only.value is True:
+        # ``local_files_only=True`` is a pure cache lookup for every
+        # HuggingFace loader: it raises rather than dialling, so it opens no
+        # socket and needs no guard. Counting it would force a guard onto the
+        # cache-hit path and break exactly the pre-seeded air-gapped deployment
+        # we want to keep working. (The network fallback beside it still
+        # counts.) Only the literal ``True`` qualifies: ``not allow_download``
+        # is a download whenever the expression is false.
         return None
-    if name.endswith("hf_hub_download"):
-        # ``local_files_only=True`` is a pure cache lookup: huggingface_hub
-        # raises rather than dialling, so it opens no socket and needs no
-        # guard. Counting it would force a guard onto the cache-hit path and
-        # break exactly the pre-seeded air-gapped deployment we want to keep
-        # working. (The network fallback beside it still counts.)
-        for keyword in call.keywords:
-            if (
-                keyword.arg == "local_files_only"
-                and isinstance(keyword.value, ast.Constant)
-                and keyword.value.value is True
-            ):
-                return None
-    return name
+    if _EGRESS_CALLEES.match(canonical):
+        return canonical
+    if _EGRESS_CALLEES.match(raw):
+        return raw
+    if local_files_only is not None:
+        # Any call that takes ``local_files_only`` and is not pinned to
+        # ``True`` is a HuggingFace loader that can download, whatever the
+        # callable is named — including one passed in as a parameter
+        # (``loader(name, local_files_only=False)`` inside
+        # ``onnx_runtime.hf_from_pretrained_local_first``). A name-based regex
+        # alone would never see that indirection.
+        return raw
+    return None
 
 
 def _python_egress_sites(source: str) -> list[_Site]:
@@ -1941,6 +2330,15 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "OpenAI embedder in the same file reaches api.openai.com and IS "
         "guarded; so are the HuggingFace fetches, via "
         "onnx_runtime.hf_hub_download_local_first.",
+    ),
+    "evals/datasets.py": (
+        1,
+        "cache-only: the first load_dataset in load_hf_dataset runs only "
+        "under is_offline(), with datasets.config.HF_HUB_OFFLINE and "
+        "huggingface_hub's HF_HUB_OFFLINE constant both forced to True for "
+        "its duration, so a pre-seeded eval dataset loads from the cache and a "
+        "cold one raises without opening a socket. The network load below it "
+        "calls guard_egress first.",
     ),
     "relevance/embedding.py": (
         1,
@@ -2100,6 +2498,8 @@ class TestEgressChokepointCoverage:
             "transforms/kompress_remote.py",
             "observability/metrics.py",
             "onnx_runtime.py",
+            "tokenizers/huggingface.py",
+            "evals/datasets.py",
         ):
             assert relpath in sites, f"{relpath} has no detected egress site at all"
             assert any(site.guarded for site in sites[relpath]), (
@@ -2194,6 +2594,67 @@ class TestSiteScannerRules:
         )
         sites = _python_egress_sites(source)
         assert [site.line for site in sites] == [3]
+
+    def test_transformers_from_pretrained_is_a_site(self) -> None:
+        source = (
+            "from transformers import AutoModel\n"
+            "def f(name):\n"
+            "    return AutoModel.from_pretrained(name)\n"
+        )
+        assert [site.callee for site in _python_egress_sites(source)] == [
+            "transformers.AutoModel.from_pretrained"
+        ]
+
+    def test_a_cache_only_from_pretrained_is_not_a_site(self) -> None:
+        source = (
+            "def f(name):\n    return AutoProcessor.from_pretrained(name, local_files_only=True)\n"
+        )
+        assert _python_egress_sites(source) == []
+
+    def test_a_computed_local_files_only_is_still_a_site(self) -> None:
+        """``local_files_only=not allow_download`` is a download whenever the
+        expression is false — the Kompress encoder's exact unguarded shape."""
+        source = (
+            "def f(name, allow_download):\n"
+            "    return AutoModel.from_pretrained(name, local_files_only=not allow_download)\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
+
+    def test_an_indirect_loader_is_caught_by_its_keyword(self) -> None:
+        """A loader passed in as a parameter has no recognisable name; taking
+        ``local_files_only`` at all is what marks it as a HuggingFace load."""
+        source = (
+            "def f(loader, name):\n"
+            "    loader(name, local_files_only=True)\n"
+            "    return loader(name, local_files_only=False)\n"
+        )
+        sites = _python_egress_sites(source)
+        assert [(site.line, site.guarded) for site in sites] == [(3, False)]
+
+    def test_a_guarded_remote_fallback_counts_as_guarded(self) -> None:
+        source = (
+            "def f(loader, name):\n"
+            "    try:\n"
+            "        return loader(name, local_files_only=True)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "    guard_egress('model', 'huggingface.co')\n"
+            "    return loader(name, local_files_only=False)\n"
+        )
+        assert [site.guarded for site in _python_egress_sites(source)] == [True]
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            "SentenceTransformer(name, device='cpu')",
+            "snapshot_download(name)",
+            "load_dataset(name, split='test')",
+            "AutoTokenizer.from_pretrained(name, trust_remote_code=False)",
+        ],
+    )
+    def test_other_hf_download_apis_are_sites(self, call: str) -> None:
+        source = f"def f(name):\n    return {call}\n"
+        assert [site.guarded for site in _python_egress_sites(source)] == [False]
 
     def test_a_method_named_post_is_not_requests_post(self) -> None:
         source = "def f(self):\n    return self.client.post('/x')\n"

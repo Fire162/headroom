@@ -28,12 +28,13 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
-from ..offline import OFFLINE_ENV, OfflineEgressBlocked, guard_egress
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     _resolve_revision,
     create_cpu_session_options,
     hf_entry_known_absent,
+    hf_from_pretrained_local_first,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -251,6 +252,38 @@ def _hf_artifact(model_id: str, filename: str, *, allow_network: bool) -> str:
             blocked,
         )
         raise KompressModelNotCached(model_id) from blocked
+
+
+def _hf_pretrained(
+    loader: Any, name: str, *, purpose: str, allow_download: bool, **kwargs: Any
+) -> Any:
+    """``hf_from_pretrained_local_first`` with Kompress's two translations.
+
+    The ``from_pretrained`` counterpart of :func:`_hf_artifact`: cache first,
+    ``guard_egress`` before any remote attempt, and both "not cached while
+    downloads are disallowed" and "not cached while ``HEADROOM_OFFLINE`` is set"
+    surface as :class:`KompressModelNotCached` — the error every Kompress caller
+    already treats as "use the non-ML path". A genuine remote failure while
+    downloads are allowed propagates unchanged.
+    """
+    try:
+        return hf_from_pretrained_local_first(
+            loader, name, purpose=purpose, allow_network=allow_download, **kwargs
+        )
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: the %s (%s) is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            purpose,
+            name,
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached(name) from blocked
+    except _NOT_CACHED_ERRORS as exc:
+        if allow_download:
+            raise
+        raise KompressModelNotCached(name) from exc
 
 
 # Model cache: model_id -> (model, tokenizer, backend)
@@ -644,11 +677,14 @@ def _get_model_class() -> type:
             super().__init__()
             # Same pin as the tokenizer: the fine-tuned heads were trained on
             # this encoder snapshot. Unknown repos resolve to None (floating).
-            self.encoder = AutoModel.from_pretrained(
+            # Cache first, air-gap guard before any download (see _hf_pretrained).
+            self.encoder = _hf_pretrained(
+                AutoModel.from_pretrained,
                 model_name,
+                purpose="Kompress PyTorch encoder",
+                allow_download=allow_download,
                 attn_implementation="eager",
                 revision=_resolve_revision(model_name, revision),
-                local_files_only=not allow_download,
             )
             hidden_size = self.encoder.config.hidden_size  # 768
 
@@ -902,8 +938,11 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
 
     Same files, same tokenizer, so the loaded object is identical; this only
     changes whether the Hub is consulted to confirm what is already on disk.
-    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
-    this loader already uses.
+    Goes through ``onnx_runtime.hf_from_pretrained_local_first`` (via
+    :func:`_hf_pretrained`), the ``from_pretrained`` twin of the
+    ``hf_hub_download_local_first`` the ONNX half of this loader uses, so a cache
+    miss under ``HEADROOM_OFFLINE`` is refused before any remote attempt even
+    when ``HF_HUB_OFFLINE=0`` is set explicitly.
 
     The load is pinned to the same immutable revision as the model artifacts
     (``onnx_runtime._PINNED_REVISIONS``): the ONNX export was produced against
@@ -911,28 +950,12 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
     the shipped weights without any code change. ``HEADROOM_HF_PIN=off`` floats
     it, exactly as for the weights.
     """
-    revision = _resolve_revision(_MODERNBERT_TOKENIZER_REPO, None)
-    try:
-        return auto_tokenizer.from_pretrained(
-            _MODERNBERT_TOKENIZER_REPO, revision=revision, local_files_only=True
-        )
-    except _NOT_CACHED_ERRORS as exc:
-        if not allow_download:
-            raise KompressModelNotCached(_MODERNBERT_TOKENIZER_REPO) from exc
-    # Genuine cache miss and downloading is permitted: fetch it at the pin,
-    # unless the air-gap forbids it — translated exactly as _hf_artifact does.
-    try:
-        guard_egress("Kompress tokenizer download", f"huggingface.co/{_MODERNBERT_TOKENIZER_REPO}")
-    except OfflineEgressBlocked as blocked:
-        logger.warning(
-            "Kompress: the ModernBERT tokenizer is not cached and %s forbids fetching it (%s). "
-            "Compression falls back to the non-ML path.",
-            OFFLINE_ENV,
-            blocked,
-        )
-        raise KompressModelNotCached(_MODERNBERT_TOKENIZER_REPO) from blocked
-    return auto_tokenizer.from_pretrained(
-        _MODERNBERT_TOKENIZER_REPO, revision=revision, local_files_only=False
+    return _hf_pretrained(
+        auto_tokenizer.from_pretrained,
+        _MODERNBERT_TOKENIZER_REPO,
+        purpose="ModernBERT tokenizer",
+        allow_download=allow_download,
+        revision=_resolve_revision(_MODERNBERT_TOKENIZER_REPO, None),
     )
 
 

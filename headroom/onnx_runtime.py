@@ -174,6 +174,76 @@ def hf_entry_known_absent(repo_id: str, filename: str, *, revision: str | None =
     return result is _CACHED_NO_EXIST
 
 
+def _hf_not_cached_errors() -> tuple[type[BaseException], ...]:
+    """Errors a ``local_files_only=True`` load raises on a plain cache miss.
+
+    Transformers and sentence-transformers both surface a miss as ``OSError``;
+    huggingface_hub's own lookup errors are listed explicitly in case a loader
+    lets one through unwrapped.
+    """
+    try:
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+    except Exception:  # pragma: no cover - huggingface_hub ships with every HF loader
+        return (OSError,)
+    return (LocalEntryNotFoundError, EntryNotFoundError, OSError)
+
+
+def hf_from_pretrained_local_first(
+    loader: Any,
+    name_or_path: str,
+    *,
+    purpose: str,
+    allow_network: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Load a HuggingFace model/tokenizer/processor, local cache first.
+
+    The ``from_pretrained`` twin of :func:`hf_hub_download_local_first`, for
+    every loader that takes ``local_files_only`` — ``AutoModel.from_pretrained``,
+    ``AutoTokenizer.from_pretrained``, ``AutoProcessor.from_pretrained``,
+    ``SentenceTransformer`` and friends. ``loader`` is that callable, passed
+    uncalled; ``kwargs`` are forwarded to both attempts.
+
+    1. ``local_files_only=True``: a pure cache lookup that cannot open a socket.
+       A warm (or pre-seeded air-gapped) cache loads here and never touches the
+       network, which also skips the Hub re-validation round-trips a plain
+       ``from_pretrained`` makes on every load.
+    2. On a cache miss, :func:`guard_egress` runs BEFORE the remote attempt.
+
+    Why the guard and not ``HF_HUB_OFFLINE``: ``apply_offline_env`` sets it with
+    ``setdefault``, so an explicit ``HF_HUB_OFFLINE=0`` wins, and only the proxy
+    process calls it at all. Under that configuration huggingface_hub's offline
+    constant is false even with ``TRANSFORMERS_OFFLINE=1``, and a bare
+    ``from_pretrained`` downloads. ``HEADROOM_OFFLINE`` is the master switch;
+    this guard is what makes it one for model loaders.
+
+    Args:
+        loader: The ``from_pretrained``-style callable.
+        name_or_path: Hub repo id or local directory.
+        purpose: What is being loaded, for the refusal message ("SigLIP model").
+        allow_network: When ``False`` a cache miss re-raises the local-lookup
+            error instead of falling back to a download.
+        **kwargs: Forwarded to ``loader`` (``revision=``, ``device=``, ...).
+
+    Raises:
+        OfflineEgressBlocked: ``HEADROOM_OFFLINE`` is set and the model is not
+            cached. Callers translate this into their own "model unavailable".
+        The loader's own error on a cache miss when ``allow_network`` is
+        ``False``, when ``name_or_path`` is a local directory (nothing remote
+        to fall back to), or when the remote attempt itself fails.
+    """
+    kwargs.pop("local_files_only", None)
+    try:
+        return loader(name_or_path, local_files_only=True, **kwargs)
+    except _hf_not_cached_errors():
+        # A local directory that failed to load has no remote to fall back to;
+        # surface the real error rather than a download attempt or a refusal.
+        if not allow_network or os.path.isdir(name_or_path):
+            raise
+    guard_egress(f"HuggingFace download of {purpose} ({name_or_path})", "huggingface.co")
+    return loader(name_or_path, local_files_only=False, **kwargs)
+
+
 def create_cpu_session_options(
     ort: Any,
     *,
