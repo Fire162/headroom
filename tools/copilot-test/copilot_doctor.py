@@ -28,6 +28,7 @@ import httpx
 
 try:
     from headroom import copilot_auth
+    from headroom.copilot_auth import display_url, scrub_urls
 except Exception as e:  # noqa: BLE001
     raise SystemExit(
         f"Run me from the headroom repo via .venv/bin/python — import failed: {e}"
@@ -62,7 +63,8 @@ def status_msg(r: httpx.Response) -> tuple[int, str]:
         "OK" if r.status_code == 200 else r.text[:40]
     )
     # Upstream errors can echo a credential — keep only its type prefix.
-    return r.status_code, _TOKEN_RE.sub(r"\1…", str(msg))[:46]
+    # ...and a URL in it can carry userinfo/query/fragment credentials.
+    return r.status_code, _TOKEN_RE.sub(r"\1…", scrub_urls(msg))[:46]
 
 
 print("=" * 64)
@@ -79,7 +81,8 @@ for v in (
     "GITHUB_COPILOT_ENTERPRISE_URL",
     "GITHUB_COPILOT_ENTERPRISE_DOMAIN",
 ):
-    print(f"    {v:38s} {os.environ.get(v) or 'unset'}")
+    # URL-valued: show scheme/host/port/path only — userinfo/query/fragment can hold secrets.
+    print(f"    {v:38s} {display_url(os.environ.get(v)) or 'unset'}")
 
 # [2] Credential files ------------------------------------------------------
 head("[2] Credential files on this machine")
@@ -118,7 +121,7 @@ try:
     print(
         f"    api token : {redact(api_token)}  kind={'tid_(exchanged)' if api_token.startswith('tid_') else 'gho_(used DIRECTLY — no exchange)'}"
     )
-    print(f"    api host  : {api_url}")
+    print(f"    api host  : {display_url(api_url)}")
     _host = (urlparse(api_url).hostname or "").lower()
     if _host == "ghe.com" or _host.endswith(".ghe.com") or "enterprise" in _host:
         print("    host type : ENTERPRISE / data-residency")
@@ -129,7 +132,7 @@ try:
             "    host type : generic public host  (set GITHUB_COPILOT_API_URL to test an enterprise host)"
         )
 except Exception as e:  # noqa: BLE001
-    print(f"    ERROR: {e}")
+    print(f"    ERROR: {scrub_urls(e)}")
 
 # [5] Exact OUTBOUND request Headroom would forward (capture) ---------------
 head("[5] OUTBOUND capture — exactly what Headroom forwards to GitHub")
@@ -137,7 +140,7 @@ try:
     sample = asyncio.run(copilot_auth.apply_copilot_api_auth({}, url=f"{api_url}/chat/completions"))
     auth = next((v for k, v in sample.items() if k.lower() == "authorization"), "")
     sch, _, raw = auth.partition(" ")
-    print(f"    POST {api_url}/chat/completions")
+    print(f"    POST {display_url(api_url)}/chat/completions")
     print(
         f"    Authorization        : {sch} {redact(raw)}  ({copilot_auth._token_kind(raw) if raw else 'none'})"
     )
@@ -145,7 +148,7 @@ try:
         v = next((vv for kk, vv in sample.items() if kk.lower() == k.lower()), None)
         print(f"    {k:21s}: {v or '(absent)'}")
 except Exception as e:  # noqa: BLE001
-    print(f"    capture error: {e}")
+    print(f"    capture error: {scrub_urls(e)}")
 
 # [6] Catalog ---------------------------------------------------------------
 # Same identity headers (incl. integration ID) the token above was minted for —
@@ -170,7 +173,7 @@ if api_token:
             f"    http={r.status_code}  total={len(ids)}  premium_listed={', '.join(prem[:10]) or '(none)'}"
         )
     except Exception as e:  # noqa: BLE001
-        print(f"    error: {e}")
+        print(f"    error: {scrub_urls(e)}")
 
 # [7] Inference entitlement — chat + /responses fallback --------------------
 head("[7] Inference entitlement (RUN: /chat/completions, then /responses for reasoning models)")
@@ -226,7 +229,7 @@ try:
     xapi_dropped = not any(k.lower() == "x-api-key" for k in resolved)
     print(f"    client presents : Bearer {sim[:14]}…  (a tid_ session token)")
     print(
-        f"    Headroom sends  : {'UNCHANGED ✅' if passthru else 'REPLACED ❌ → ' + fwd[:24]}   (x-api-key dropped: {xapi_dropped})"
+        f"    Headroom sends  : {'UNCHANGED ✅' if passthru else 'REPLACED ❌ → ' + redact(fwd.partition(' ')[2])}   (x-api-key dropped: {xapi_dropped})"
     )
     print(
         "    → "
@@ -237,7 +240,7 @@ try:
         )
     )
 except Exception as e:  # noqa: BLE001
-    print(f"    error: {e}")
+    print(f"    error: {scrub_urls(e)}")
 
 # [9] Verdict ---------------------------------------------------------------
 head("VERDICT")
@@ -247,7 +250,7 @@ print(
 print(
     f"    Token forwarded     : {'none' if not api_token else ('tid_ session' if api_token.startswith('tid_') else 'OAuth (direct, no exchange)')}"
 )
-print(f"    API host            : {api_url}")
+print(f"    API host            : {display_url(api_url)}")
 print(
     f"    USABLE now          : {', '.join(m for m, sc in results.items() if sc == 200) or '(none)'}"
 )

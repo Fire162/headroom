@@ -24,6 +24,15 @@ from pathlib import Path
 
 import httpx
 
+try:
+    from headroom.copilot_auth import display_url
+except Exception as e:  # noqa: BLE001
+    raise SystemExit(
+        f"Run me from the headroom repo via .venv/bin/python — import failed: {e}"
+    ) from e
+
+# HOST is used verbatim for requests; print only display_url(HOST), since URL
+# userinfo/query/fragment can carry credentials.
 HOST = os.environ.get("GITHUB_COPILOT_API_URL", "https://api.githubcopilot.com").rstrip("/")
 PORT = int(os.environ.get("HR_TEST_PORT", "8911"))
 CAP = Path("/tmp/hr_enterprise_capture.jsonl")
@@ -48,7 +57,7 @@ env = {
 
 print("=" * 64)
 print(" HEADROOM × COPILOT — PHASE B (live proxy through-path)")
-print(f" host = {HOST}   port = {PORT}")
+print(f" host = {display_url(HOST)}   port = {PORT}")
 print("=" * 64)
 
 base = f"http://127.0.0.1:{PORT}"
@@ -119,7 +128,7 @@ try:
             if key in seen:
                 continue
             seen.add(key)
-            print(f"  → {r['url']}  token={r['auth_scheme']}/{r['token_kind']}")
+            print(f"  → {display_url(r['url'])}  token={r['auth_scheme']}/{r['token_kind']}")
     else:
         print("  (no capture written — requests may not have reached the Copilot auth path)")
 finally:
@@ -133,7 +142,7 @@ finally:
 print("\n" + "=" * 64)
 print(" PHASE B VERDICT")
 ok = {m: sc for m, sc, _ in rows}
-print(f"  host reached        : {HOST}")
+print(f"  host reached        : {display_url(HOST)}")
 print(f"  gpt-4o through proxy: {'✅ PASS' if ok.get('gpt-4o') == 200 else '❌ FAIL'}")
 prem_ok = any(sc == 200 for m, sc, _ in rows if m != "gpt-4o")
 print(

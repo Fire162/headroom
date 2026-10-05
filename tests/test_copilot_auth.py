@@ -1566,6 +1566,32 @@ def test_capture_outbound_drops_url_credentials(
         assert secret not in logged
 
 
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        ("https://u:USERINFO_SECRET@api.example.test:8443/v1", "https://api.example.test:8443/v1"),
+        ("https://api.example.test/v1?access_token=QUERY_SECRET", "https://api.example.test/v1"),
+        ("https://api.example.test/v1#FRAGMENT_SECRET", "https://api.example.test/v1"),
+        ("https://api.example.test/v1;PARAM_SECRET", "https://api.example.test/v1"),
+        ("tenant.ghe.com", "tenant.ghe.com"),
+        ("u:USERINFO_SECRET@tenant.ghe.com", "tenant.ghe.com"),
+        ("https://[::1]:8443/x", "https://[::1]:8443/x"),
+        ("https://api.example.test:99999/x", "https://api.example.test/x"),
+        ("https://[bad?QUERY_SECRET", "(unparseable URL)"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_display_url_drops_credentials_and_never_raises(raw: object, shown: str) -> None:
+    assert copilot_auth.display_url(raw) == shown
+
+
+def test_scrub_urls_sanitizes_urls_inside_text() -> None:
+    msg = "connect failed for https://u:USERINFO_SECRET@h.test/p?t=QUERY_SECRET#F_SECRET (timeout)"
+    out = copilot_auth.scrub_urls(msg)
+    assert out == "connect failed for https://h.test/p (timeout)"
+
+
 def test_capture_outbound_disabled_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

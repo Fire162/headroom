@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from collections.abc import Mapping
@@ -1639,6 +1640,60 @@ def _token_kind(token: str) -> str:
     return "unknown" if t else "empty"
 
 
+_URL_IN_TEXT_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
+
+
+def _url_display_parts(url: object) -> tuple[str, str, str]:
+    """Split *url* into the parts that are safe to show: scheme, host[:port], path.
+
+    Userinfo, params, query and fragment are dropped because they can carry
+    credentials. A value without a scheme (``host.example/path``) is parsed as a
+    network location. Raises on input ``urlparse`` cannot handle; callers that
+    must never raise go through :func:`display_url`.
+    """
+
+    text = str(url or "").strip()
+    parsed = urlparse(text if "://" in text or text.startswith("//") else f"//{text}")
+    host = parsed.hostname or ""
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:  # out-of-range or non-numeric port: show none of it
+        port = None
+    if port is not None and host:
+        host = f"{host}:{port}"
+    return parsed.scheme, host, parsed.path
+
+
+def display_url(url: object) -> str:
+    """Return *url* reduced to scheme, host, port and path, safe for display.
+
+    Userinfo, query and fragment are dropped. Never raises: malformed input
+    yields a fixed placeholder instead of the raw value. Use the original URL for
+    requests; this is for output only.
+    """
+
+    try:
+        if not str(url or "").strip():
+            return ""
+        scheme, host, path = _url_display_parts(url)
+        shown = f"{scheme}://{host}{path}" if scheme else f"{host}{path}"
+        return shown or "(unparseable URL)"
+    except Exception:  # noqa: BLE001 - display must never fail
+        return "(unparseable URL)"
+
+
+def scrub_urls(text: object) -> str:
+    """Replace every URL inside free *text* (e.g. an exception message) with
+    :func:`display_url` of it. Never raises."""
+
+    try:
+        return _URL_IN_TEXT_RE.sub(lambda m: display_url(m.group(0)), str(text))
+    except Exception:  # noqa: BLE001 - display must never fail
+        return "(unprintable)"
+
+
 def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
     """Debug hook: when ``HEADROOM_COPILOT_DEBUG_OUTBOUND`` is set, append a
     secret-free record of the request Headroom is about to forward to the Copilot
@@ -1676,13 +1731,10 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
                     break
         # Keep only scheme, hostname, port and path: userinfo, query and fragment can
         # carry credentials, and must not reach the file or the log.
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
+        scheme, host, path = _url_display_parts(url)
         record = {
             "host": host,
-            "url": f"{parsed.scheme}://{host}{parsed.path}",
+            "url": f"{scheme}://{host}{path}" if scheme else f"{host}{path}",
             "auth_scheme": scheme_label,
             "token_kind": token_label,
         }
