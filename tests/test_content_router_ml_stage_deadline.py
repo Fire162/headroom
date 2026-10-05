@@ -16,6 +16,7 @@ slow stage is entered, not how slow it is.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import random
 import threading
@@ -546,3 +547,132 @@ def test_remote_kompress_keeps_its_default_timeout_without_a_budget() -> None:
     assert out.compressed != text
     assert timeouts == [{"connect": 20.0, "read": 20.0, "write": 20.0, "pool": 20.0}]
     assert remote._capped_pool is None, "the default path must not hop threads"
+
+
+# --------------------------------------------------------------------------- #
+# Fourth review: the capped worker pool had no admission bound. Its queue is
+# unbounded and ``future.cancel()`` does not drop a queued payload, so once
+# every worker was held by an abandoned request, each further capped call
+# queued its full prompt, timed out, and left it there. A slow-drip body could
+# hold a worker forever, since httpx read timeouts reset on every chunk.
+# --------------------------------------------------------------------------- #
+
+
+def _free_permits(remote: RemoteKompressCompressor) -> int:
+    return remote._capped_slots._value  # type: ignore[attr-defined]
+
+
+def _wait_until(predicate, timeout_s: float = 3.0) -> bool:
+    ends = time.monotonic() + timeout_s
+    while time.monotonic() < ends:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_saturated_remote_calls_fail_open_without_queueing_their_payloads() -> None:
+    """The reviewer's repro: hold all 16 workers with requests whose 200 ms
+    callers have already timed out, then make five more calls with 60 ms caps.
+    Each must fail open within its cap with its payload never enqueued, and
+    capacity must come back once the held requests end."""
+    from headroom.transforms.kompress_remote import _CAPPED_CALL_WORKERS
+
+    release = threading.Event()
+    reached: list[str] = []
+
+    def _stalled_endpoint(request: httpx.Request) -> httpx.Response:
+        reached.append(json.loads(request.content)["content"])
+        release.wait(5.0)
+        return _compressed_reply(request)
+
+    remote = _remote_kompress(_stalled_endpoint)
+    text = _prose(2_000)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(_CAPPED_CALL_WORKERS) as callers:
+            held = list(
+                callers.map(
+                    lambda i: remote.compress(f"held{i} {text}", _time_budget_cap_seconds=0.2),
+                    range(_CAPPED_CALL_WORKERS),
+                )
+            )
+        assert all(out.compressed == f"held{i} {text}" for i, out in enumerate(held))
+        assert len(reached) == _CAPPED_CALL_WORKERS
+        assert _free_permits(remote) == 0, "abandoned requests must keep their permits"
+
+        for i in range(5):
+            late = f"late{i} {text}"
+            started = time.monotonic()
+            out = remote.compress(late, _time_budget_cap_seconds=0.06)
+            took = time.monotonic() - started
+            assert out.compressed == late, "a saturated call must fail open unchanged"
+            assert took < 0.06 + 0.1, f"saturated call took {took:.3f}s against a 60 ms cap"
+            assert remote._capped_pool._work_queue.qsize() == 0, "a payload was enqueued"
+
+        assert len(reached) == _CAPPED_CALL_WORKERS, "a saturated call reached the endpoint"
+    finally:
+        release.set()
+
+    assert _wait_until(lambda: _free_permits(remote) == _CAPPED_CALL_WORKERS)
+    recovered = remote.compress(text, _time_budget_cap_seconds=2.0)
+    assert recovered.compressed != text, "capacity must return once the held requests end"
+    remote.close()
+
+
+def test_slow_drip_response_is_cut_off_at_an_absolute_deadline() -> None:
+    """A body that keeps dripping (a chunk every 50 ms for 2 s) resets httpx's
+    read timeout on every chunk. The worker must stop at the cap's absolute
+    deadline and give its permit back, not ride the response to the end."""
+    from headroom.transforms.kompress_remote import _CAPPED_CALL_WORKERS
+
+    chunks_sent: list[int] = []
+
+    def _dripping_endpoint(request: httpx.Request) -> httpx.Response:
+        reply = json.dumps({"compressed": "short"}).encode()
+
+        def _drip():
+            for i in range(40):
+                chunks_sent.append(i)
+                time.sleep(0.05)
+                yield b" "  # JSON-legal leading whitespace
+            yield reply
+
+        return httpx.Response(200, content=_drip())
+
+    remote = _remote_kompress(_dripping_endpoint)
+    text = _prose(2_000)
+    cap = 0.2
+    started = time.monotonic()
+    out = remote.compress(text, _time_budget_cap_seconds=cap)
+    assert out.compressed == text
+    assert time.monotonic() - started < cap + 0.1
+
+    assert _wait_until(lambda: _free_permits(remote) == _CAPPED_CALL_WORKERS, timeout_s=1.0), (
+        "the dripping request still holds its permit"
+    )
+    assert time.monotonic() - started < 1.0, "the worker rode the drip instead of the deadline"
+    assert len(chunks_sent) < 10, f"read {len(chunks_sent)} chunks past a {cap}s deadline"
+    remote.close()
+
+
+def test_permit_is_held_until_the_worker_finishes_not_the_caller() -> None:
+    """Releasing on caller timeout would let abandoned requests pile up again;
+    the permit belongs to the running request."""
+    from headroom.transforms.kompress_remote import _CAPPED_CALL_WORKERS
+
+    release = threading.Event()
+
+    def _stalled_endpoint(request: httpx.Request) -> httpx.Response:
+        release.wait(5.0)
+        return _compressed_reply(request)
+
+    remote = _remote_kompress(_stalled_endpoint)
+    text = _prose(2_000)
+    try:
+        out = remote.compress(text, _time_budget_cap_seconds=0.1)
+        assert out.compressed == text
+        assert _free_permits(remote) == _CAPPED_CALL_WORKERS - 1
+    finally:
+        release.set()
+    assert _wait_until(lambda: _free_permits(remote) == _CAPPED_CALL_WORKERS)
+    remote.close()

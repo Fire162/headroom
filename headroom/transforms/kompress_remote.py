@@ -54,6 +54,7 @@ never correctness.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import logging
 import threading
 import time
@@ -112,10 +113,13 @@ _MIN_WORDS = 10
 # behind. The block passes through unchanged instead.
 _MIN_REMOTE_BUDGET_SECONDS = 0.05
 
-# Workers for budget-capped calls. A call that overruns its cap is abandoned,
-# not killed (a sync httpx request cannot be interrupted from another thread);
-# its per-phase timeouts are lowered to the cap too, so an abandoned worker is
-# freed soon after.
+# Workers for budget-capped calls, and the number of admission permits. A call
+# whose caller times out is abandoned, not killed (a sync httpx request cannot be
+# interrupted from another thread), so the worker keeps its permit until the
+# request itself ends -- and every request ends at an absolute deadline (see
+# ``_capped_request``). With permits == workers nothing ever waits in the
+# executor's (unbounded) queue: a saturated caller waits for a permit, not with
+# its payload enqueued, and fails open when its own deadline passes.
 _CAPPED_CALL_WORKERS = 16
 
 
@@ -177,6 +181,7 @@ class RemoteKompressCompressor:
         self._client = httpx.Client(timeout=timeout, transport=transport)
         self._capped_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._capped_pool_lock = threading.Lock()
+        self._capped_slots = threading.BoundedSemaphore(_CAPPED_CALL_WORKERS)
 
     @property
     def url(self) -> str:
@@ -356,21 +361,71 @@ class RemoteKompressCompressor:
     def _post_within(self, payload: dict[str, Any], cap: float) -> Any:
         """POST and read the response within *cap* seconds in total.
 
-        httpx timeouts are per phase (connect, write, each read, pool), so a
-        request under ``timeout=cap`` can still take several times *cap*. The
-        request therefore runs on a worker and is waited on with one overall
-        deadline; the per-phase timeouts are lowered to *cap* as well so an
-        abandoned worker does not linger for the 20s default.
+        httpx timeouts are per phase (connect, write, pool, and each read
+        between chunks), so ``timeout=cap`` alone neither bounds the call nor
+        stops a slow-drip body. Three things together do:
+
+        * **Admission.** A permit (one per worker) is taken before submitting,
+          waiting at most until the caller's deadline. Saturated means fail
+          open, with the payload never enqueued -- ``future.cancel()`` does not
+          free a queued payload, so an unbounded queue would retain every
+          timed-out prompt.
+        * **Caller deadline.** The caller waits for the worker with one overall
+          deadline and passes the block through unchanged when it runs out.
+        * **Worker deadline.** The worker keeps its permit until it actually
+          finishes (released in its own ``finally``, never on caller timeout),
+          and it finishes by an absolute deadline: per-phase timeouts are capped
+          to what is left, and the body is streamed and cut off at the
+          deadline, so a dripping response cannot hold a permit indefinitely.
         """
-        started = time.monotonic()
-        future = self._get_capped_pool().submit(self._post, payload, min(cap, self._timeout))
+        deadline = time.monotonic() + cap
+        if not self._capped_slots.acquire(timeout=max(0.0, cap)):
+            raise TimeoutError(
+                f"all {_CAPPED_CALL_WORKERS} remote Kompress workers busy for the "
+                f"request ML budget ({cap:.3f}s)"
+            )
         try:
-            return future.result(timeout=max(0.0, cap - (time.monotonic() - started)))
+            future = self._get_capped_pool().submit(self._capped_request, payload, deadline)
+        except BaseException:
+            self._capped_slots.release()  # never reached the worker that would
+            raise
+        try:
+            return future.result(timeout=max(0.0, deadline - time.monotonic()))
         except concurrent.futures.TimeoutError:
-            future.cancel()
             raise TimeoutError(
                 f"exceeded the request ML budget ({cap:.3f}s) before the endpoint answered"
             ) from None
+
+    def _capped_request(self, payload: dict[str, Any], deadline: float) -> Any:
+        """The worker side of :meth:`_post_within`. Owns one admission permit.
+
+        Lifetime is bounded by *deadline* plus at most one per-phase timeout
+        (itself no longer than what was left at start): every httpx phase is
+        capped to the time remaining, and the body is read chunk by chunk with
+        the absolute deadline checked after each one.
+        """
+        try:
+            left = deadline - time.monotonic()
+            if left <= 0.0:
+                raise TimeoutError("request ML budget spent before the request started")
+            with self._client.stream(
+                "POST",
+                self._url,
+                headers=self._headers,
+                json=payload,
+                timeout=min(left, self._timeout),
+            ) as resp:
+                resp.raise_for_status()
+                body = bytearray()
+                for chunk in resp.iter_bytes():
+                    body += chunk
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "remote Kompress response outlived the request ML budget"
+                        )
+            return json.loads(bytes(body))
+        finally:
+            self._capped_slots.release()
 
     def _get_capped_pool(self) -> concurrent.futures.ThreadPoolExecutor:
         with self._capped_pool_lock:
