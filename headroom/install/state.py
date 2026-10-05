@@ -20,6 +20,7 @@ from .paths import (
     deploy_root,
     manifest_path,
     profile_root,
+    recovery_manifest_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
     fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -60,6 +61,52 @@ def _atomic_write_text(path: Path, data: str) -> None:
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _manifest_json(manifest: DeploymentManifest) -> str:
+    return json.dumps(asdict(manifest), indent=2) + "\n"
+
+
+def _narrow_profile_root(root: Path) -> None:
+    """Make a deployment profile directory owner-only.
+
+    ``exist_ok=True`` leaves a pre-existing directory's mode alone, and a
+    profile created before owner-only modes is 0755, so narrow it on every save
+    rather than only at creation.
+
+    Not fatal, unlike the runner script: the manifest itself is created through
+    ``mkstemp``, which is 0600 from birth, so a directory that could not be
+    narrowed weakens the outer layer without exposing the file. Warn rather
+    than abandon a deployment over it.
+    """
+    if not chmod_owner_only(root, OWNER_ONLY_DIR_MODE) and POSIX_MODES_ENFORCED:
+        logger.warning(
+            "Deployment profile directory %s is not owner-only; the "
+            "manifest inside it is still 0o%o, but other local users can "
+            "list the directory.",
+            root,
+            OWNER_ONLY_FILE_MODE,
+        )
+
+
+def _save_manifest_at(
+    path: Path,
+    manifest: DeploymentManifest,
+    *,
+    strict: bool,
+    owner_only_dir: bool = False,
+) -> None:
+    root = path.parent
+    root.mkdir(parents=True, exist_ok=True)
+    if owner_only_dir:
+        _narrow_profile_root(root)
+    manifest.updated_at = iso_utc_now()
+    try:
+        _atomic_write_text(path, _manifest_json(manifest))
+    except OSError:
+        if strict:
+            raise
+        logger.warning("Cannot save deployment manifest: %s — continuing without persistence", path)
 
 
 def save_manifest(manifest: DeploymentManifest) -> None:
@@ -75,28 +122,29 @@ def save_manifest(manifest: DeploymentManifest) -> None:
     :data:`headroom.install.paths.OWNER_ONLY_DIR_MODE`.
     """
     try:
-        root = profile_root(manifest.profile)
-        root.mkdir(parents=True, exist_ok=True)
-        # `exist_ok=True` leaves a pre-existing directory's mode alone, and a
-        # profile created before this change is 0755, so narrow it every save
-        # rather than only at creation.
-        # Not fatal, unlike the runner script: the manifest itself is created
-        # through `mkstemp`, which is 0600 from birth, so a directory that
-        # could not be narrowed weakens the outer layer without exposing the
-        # file. Warn rather than abandon a deployment over it.
-        if not chmod_owner_only(root, OWNER_ONLY_DIR_MODE) and POSIX_MODES_ENFORCED:
-            logger.warning(
-                "Deployment profile directory %s is not owner-only; the "
-                "manifest inside it is still 0o%o, but other local users can "
-                "list the directory.",
-                root,
-                OWNER_ONLY_FILE_MODE,
-            )
-        manifest.updated_at = iso_utc_now()
-        path = manifest_path(manifest.profile)
-        _atomic_write_text(path, json.dumps(asdict(manifest), indent=2) + "\n")
+        _save_manifest_at(
+            manifest_path(manifest.profile), manifest, strict=False, owner_only_dir=True
+        )
     except OSError as e:
         logger.warning("Cannot save deployment manifest: %s — continuing without persistence", e)
+
+
+def save_manifest_strict(manifest: DeploymentManifest) -> None:
+    """Persist a manifest and propagate errors when recovery depends on it."""
+
+    _save_manifest_at(manifest_path(manifest.profile), manifest, strict=True, owner_only_dir=True)
+
+
+def save_recovery_manifest(manifest: DeploymentManifest) -> None:
+    """Persist an inactive, complete snapshot for failed deployment recovery."""
+
+    _save_manifest_at(recovery_manifest_path(manifest.profile), manifest, strict=True)
+
+
+def delete_recovery_manifest(profile: str = "default") -> None:
+    """Delete an inactive recovery snapshot when its transaction is complete."""
+
+    recovery_manifest_path(profile).unlink(missing_ok=True)
 
 
 # The Docker image org moved from a personal repo to the project org. The old
@@ -165,4 +213,4 @@ def delete_manifest(profile: str = "default") -> None:
 
     root = profile_root(profile)
     if root.exists():
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root)
