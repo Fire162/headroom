@@ -41,6 +41,7 @@ from headroom.proxy.body_forwarding import (
     thinking_blocks_survived_mutation,
 )
 from headroom.proxy.helpers import (
+    _path_for_log,
     _reset_session_beta_tracker_for_test,
     append_text_to_latest_user_chat_message,
     get_session_beta_tracker,
@@ -550,6 +551,24 @@ def test_log_outbound_request_strips_query_string_api_key() -> None:
     assert "AIzaSECRET" not in msg
     assert "key=" not in msg
     assert "user:pw" not in msg
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        # IPv6 upstreams keep their brackets so the log stays a valid URL.
+        ("https://[::1]:8787/v1/messages?key=SECRET", "https://[::1]:8787/v1/messages"),
+        ("http://[2001:db8::1]/v1/chat", "http://[2001:db8::1]/v1/chat"),
+        ("https://api.example.com:8443/v1?x=1#f", "https://api.example.com:8443/v1"),
+        # Relative paths pass through without a query.
+        ("/v1/messages?key=SECRET", "/v1/messages"),
+        # An invalid port makes urlsplit raise; never fall back to the raw URL.
+        ("https://host:notaport/v1?key=SECRET", "<unparseable>"),
+        ("https://[::1/v1?key=SECRET", "<unparseable>"),
+    ],
+)
+def test_path_for_log(path: str, expected: str) -> None:
+    assert _path_for_log(path) == expected
 
 
 # ---------------------------------------------------------------------------

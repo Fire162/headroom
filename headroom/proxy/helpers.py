@@ -378,11 +378,15 @@ def _path_for_log(path: str) -> str:
     """
     try:
         parts = urlsplit(path)
+        port = parts.port
     except ValueError:
         return "<unparseable>"
-    netloc = parts.hostname or ""
-    if parts.port:
-        netloc = f"{netloc}:{parts.port}"
+    host = parts.hostname or ""
+    # ``hostname`` drops the brackets around an IPv6 literal; put them back
+    # so the logged URL still names the upstream that was contacted.
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
