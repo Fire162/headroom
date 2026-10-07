@@ -2,18 +2,23 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
 
-import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
+import {
+  createHeadroomRetrieveTool,
+  getDefaultProxyUrl,
+  trimTrailingSlashes,
+} from "./retrieve.js";
 import { installHeadroomTransport } from "./transport.js";
 
 export interface HeadroomOpenCodePluginOptions {
   proxyUrl?: string;
   project?: string;
+  excludeHosts?: string[];
   backend?: string;
   debug?: boolean;
 }
 
 function normalizeProxyUrl(url: string): string {
-  return url.replace(/\/+$/, "");
+  return trimTrailingSlashes(url);
 }
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
@@ -36,6 +41,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
   });
 
