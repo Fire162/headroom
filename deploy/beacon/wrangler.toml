@@ -53,6 +53,9 @@ subrequests = 100000
 [observability]
 enabled = true
 
+[observability.logs]
+invocation_logs = false
+
 # Abuse bound for this unauthenticated endpoint, enforced in fetch(). One
 # shared key, not per-IP: the Worker never reads the sender's address, and a
 # per-IP key would mean reading it. Counters are per Cloudflare location, so
