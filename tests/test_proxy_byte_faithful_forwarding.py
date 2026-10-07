@@ -509,6 +509,49 @@ def test_log_outbound_request_emits_structured_fields() -> None:
     assert "x-api-key" not in msg.lower()
 
 
+def test_log_outbound_request_strips_query_string_api_key() -> None:
+    """Google forwarders put the API key in ``?key=``; it must not reach the log."""
+    import logging
+
+    proxy_logger = logging.getLogger("headroom.proxy")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.INFO)
+    prev_level = proxy_logger.level
+    proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    try:
+        log_outbound_request(
+            forwarder="google_batch_passthrough",
+            method="POST",
+            path=(
+                "https://user:pw@generativelanguage.googleapis.com/v1beta/"
+                "models/gemini-2.5-pro:batchGenerateContent?key=AIzaSECRET#frag"
+            ),
+            body_bytes_count=1,
+            body_mutated=False,
+            mutation_reasons=[],
+            request_id=None,
+            source="passthrough",
+        )
+    finally:
+        proxy_logger.removeHandler(handler)
+        proxy_logger.setLevel(prev_level)
+
+    msg = next(r.getMessage() for r in records if "outbound_request" in r.getMessage())
+    assert (
+        "path=https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-pro:batchGenerateContent " in msg
+    )
+    assert "AIzaSECRET" not in msg
+    assert "key=" not in msg
+    assert "user:pw" not in msg
+
+
 # ---------------------------------------------------------------------------
 # httpx-mock end-to-end byte-faithful checks
 # ---------------------------------------------------------------------------
