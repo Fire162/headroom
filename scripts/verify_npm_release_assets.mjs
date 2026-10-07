@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -65,15 +65,24 @@ function assertNoFileDependencies(pkg) {
   }
 }
 
-function runNpm(args, cwd) {
-  if (process.platform === "win32") {
-    return spawnSync("cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], {
-      cwd,
-      encoding: "utf8",
-    });
+// npm on Windows is a .cmd shim, which only runs through cmd.exe, and cmd.exe
+// reinterprets characters such as & and | inside arguments (paths included).
+// Run npm's own CLI script under this Node binary instead, so no shell is
+// involved on any platform.
+function npmCommand(args) {
+  if (process.platform !== "win32") {
+    return ["npm", args];
   }
+  const npmCli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  if (!existsSync(npmCli)) {
+    throw new Error(`npm CLI not found next to node: ${npmCli}`);
+  }
+  return [process.execPath, [npmCli, ...args]];
+}
 
-  return spawnSync("npm", args, {
+function runNpm(args, cwd) {
+  const [command, commandArgs] = npmCommand(args);
+  return spawnSync(command, commandArgs, {
     cwd,
     encoding: "utf8",
   });

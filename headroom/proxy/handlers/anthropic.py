@@ -55,6 +55,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import (
     extract_tags,
+    invalid_request_body_message,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
 )
@@ -1165,7 +1166,7 @@ class AnthropicHandlerMixin:
                         "type": "error",
                         "error": {
                             "type": "invalid_request_error",
-                            "message": f"Invalid request body: {e!s}",
+                            "message": invalid_request_body_message(e),
                         },
                     },
                 )
@@ -5650,7 +5651,7 @@ class AnthropicHandlerMixin:
                     "type": "error",
                     "error": {
                         "type": "invalid_request_error",
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                     },
                 },
             )

@@ -86,12 +86,24 @@ function run(command, args, cwd) {
   }
 }
 
-function runNpm(args, cwd) {
-  if (process.platform === "win32") {
-    run("cmd.exe", ["/d", "/s", "/c", "npm.cmd", ...args], cwd);
-    return;
+// npm on Windows is a .cmd shim, which only runs through cmd.exe, and cmd.exe
+// reinterprets characters such as & and | inside arguments (paths included).
+// Run npm's own CLI script under this Node binary instead, so no shell is
+// involved on any platform.
+function npmCommand(args) {
+  if (process.platform !== "win32") {
+    return ["npm", args];
   }
-  run("npm", args, cwd);
+  const npmCli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  if (!existsSync(npmCli)) {
+    throw new Error(`npm CLI not found next to node: ${npmCli}`);
+  }
+  return [process.execPath, [npmCli, ...args]];
+}
+
+function runNpm(args, cwd) {
+  const [command, commandArgs] = npmCommand(args);
+  run(command, commandArgs, cwd);
 }
 
 function runNode(args, cwd) {
