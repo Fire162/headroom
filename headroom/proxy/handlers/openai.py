@@ -6360,6 +6360,11 @@ class OpenAIHandlerMixin:
                             f"[{request_id}] Memory context lookup exceeded "
                             f"{RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS:.1f}s; continuing without it"
                         )
+                    except Exception as e:
+                        memory_context = None
+                        logger.warning(
+                            f"[{request_id}] Memory context lookup failed: {e}; continuing without it"
+                        )
                     if memory_context:
                         from headroom.proxy.helpers import (
                             append_text_to_latest_user_input_item,
@@ -8331,6 +8336,12 @@ class OpenAIHandlerMixin:
                             logger.info(
                                 f"[{request_id}] WS Memory: Context lookup exceeded "
                                 f"{RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS:.1f}s; "
+                                f"continuing without it"
+                            )
+                        except Exception as e:
+                            memory_context = None
+                            logger.warning(
+                                f"[{request_id}] WS Memory: Context lookup failed: {e}; "
                                 f"continuing without it"
                             )
                         if memory_context:
