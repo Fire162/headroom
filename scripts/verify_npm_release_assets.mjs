@@ -73,11 +73,30 @@ function npmCommand(args) {
   if (process.platform !== "win32") {
     return ["npm", args];
   }
-  const npmCli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-  if (!existsSync(npmCli)) {
-    throw new Error(`npm CLI not found next to node: ${npmCli}`);
+  return [process.execPath, [findNpmCli(), ...args]];
+}
+
+// Node and npm can live in different directories (a node shim, or npm
+// upgraded into the global prefix), so look where npm itself says it is, then
+// next to node, then next to every npm.cmd on PATH. Every npm.cmd install
+// keeps its CLI at node_modules/npm/bin/npm-cli.js beside the shim.
+function findNpmCli() {
+  const cliPath = path.join("node_modules", "npm", "bin", "npm-cli.js");
+  const candidates = [];
+  if (process.env.npm_execpath?.endsWith("npm-cli.js")) {
+    candidates.push(process.env.npm_execpath);
   }
-  return [process.execPath, [npmCli, ...args]];
+  candidates.push(path.join(path.dirname(process.execPath), cliPath));
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (dir && existsSync(path.join(dir, "npm.cmd"))) {
+      candidates.push(path.join(dir, cliPath));
+    }
+  }
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    throw new Error(`npm CLI (npm-cli.js) not found. Looked in: ${candidates.join(", ")}`);
+  }
+  return found;
 }
 
 function runNpm(args, cwd) {
