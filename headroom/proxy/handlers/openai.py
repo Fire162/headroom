@@ -8344,12 +8344,6 @@ class OpenAIHandlerMixin:
                                 f"{RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS:.1f}s; "
                                 f"continuing without it"
                             )
-                        except Exception as e:
-                            memory_context = None
-                            logger.warning(
-                                f"[{request_id}] WS Memory: Context lookup failed: {e}; "
-                                f"continuing without it"
-                            )
                         if memory_context:
                             # Route memory into ws_response_body["input"]
                             # (the user-input field) rather than
