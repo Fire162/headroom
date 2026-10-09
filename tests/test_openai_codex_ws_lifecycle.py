@@ -2095,7 +2095,7 @@ async def test_ws_memory_context_lookup_exception_fails_open_and_survives_subseq
     handler.memory_handler = memory_handler
 
     with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
+        await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=5.0)
 
     # Both turns must reach upstream without injected memory
     assert len(upstream.sent) == 2
