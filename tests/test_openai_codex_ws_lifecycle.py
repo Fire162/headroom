@@ -2003,6 +2003,69 @@ async def test_ws_memory_enabled_non_memory_response_streams_completion():
 
 
 @pytest.mark.asyncio
+async def test_ws_memory_context_lookup_exception_fails_open_and_survives_subsequent_traffic():
+    import sqlite3
+
+    class _FailingWsContextMemoryHandler(_MemoryWsHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config.inject_context = True
+            self.config.inject_tools = False
+            self.call_count = 0
+
+        async def search_and_format_context(self, user_id, messages, **kwargs):
+            self.call_count += 1
+            raise sqlite3.OperationalError("unable to open database file")
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "turn 1 original",
+            },
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "turn 2 original",
+            },
+        }
+    )
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-2"}}),
+    ]
+
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    memory_handler = _FailingWsContextMemoryHandler()
+    handler.memory_handler = memory_handler
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    # Both turns must reach upstream without injected memory
+    assert len(upstream.sent) == 2
+    sent0 = json.loads(upstream.sent[0])["response"]
+    sent1 = json.loads(upstream.sent[1])["response"]
+    assert sent0["input"] == "turn 1 original"
+    assert sent1["input"] == "turn 2 original"
+
+    # Streaming socket connection survived and client received all upstream events
+    assert client_ws.sent_text == upstream_events
+    assert memory_handler.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_ws_late_memory_call_after_streamed_message_passes_through():
     message_item = {
         "type": "message",
