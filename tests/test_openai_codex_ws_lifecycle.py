@@ -2035,16 +2035,60 @@ async def test_ws_memory_context_lookup_exception_fails_open_and_survives_subseq
             },
         }
     )
-    upstream_events = [
+    turn1_events = [
         json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    turn2_events = [
         json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r-2"}}),
     ]
+    expected_events = turn1_events + turn2_events
 
-    upstream = _FakeUpstream(upstream_events)
+    first_sent = asyncio.Event()
+    second_sent = asyncio.Event()
+    turn1_done = asyncio.Event()
+    turn2_done = asyncio.Event()
+    both_completed = asyncio.Event()
+
+    class _CoordinatedUpstream(_FakeUpstream):
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 1:
+                first_sent.set()
+            elif len(self.sent) == 2:
+                second_sent.set()
+
+        async def _iter(self):
+            await first_sent.wait()
+            for ev in turn1_events:
+                yield ev
+            await second_sent.wait()
+            for ev in turn2_events:
+                yield ev
+            await both_completed.wait()
+
+    class _CoordinatedClientWebSocket(_FakeWebSocket):
+        async def send_text(self, text: str) -> None:
+            await super().send_text(text)
+            if '"id": "r-1"' in text and "response.completed" in text:
+                turn1_done.set()
+            elif '"id": "r-2"' in text and "response.completed" in text:
+                turn2_done.set()
+                both_completed.set()
+
+        async def receive_text(self) -> str:
+            if not first_sent.is_set():
+                return first_frame
+            await turn1_done.wait()
+            if not second_sent.is_set():
+                return second_frame
+            await turn2_done.wait()
+            raise _FakeWebSocketDisconnect("client closed")
+
+    upstream = _CoordinatedUpstream([])
     fake_ws_mod = _make_fake_websockets_module(upstream)
-    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    client_ws = _CoordinatedClientWebSocket([])
     client_ws.headers["x-headroom-user-id"] = "user-1"
     handler = _DummyOpenAIHandler()
     memory_handler = _FailingWsContextMemoryHandler()
@@ -2061,7 +2105,7 @@ async def test_ws_memory_context_lookup_exception_fails_open_and_survives_subseq
     assert sent1["input"] == "turn 2 original"
 
     # Streaming socket connection survived and client received all upstream events
-    assert client_ws.sent_text == upstream_events
+    assert client_ws.sent_text == expected_events
     assert memory_handler.call_count == 2
 
 
